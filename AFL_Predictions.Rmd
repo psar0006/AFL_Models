@@ -1,0 +1,550 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(fitzRoy)
+library(dplyr)
+library(purrr)
+library(lubridate)
+library(slider)
+library(tidyr)
+library(lightgbm)
+source("Bookies_Scraper.R")
+source("Odds_Data_Cleaner.R")
+source("Pointsbet_Scraper.R")
+```
+
+## R Markdown
+
+```{r EWMA}
+library(purrr)
+
+calc_ewma <- function(x, alpha = 0.7) {
+  if (length(x) == 0) return(numeric(0))
+  accumulate(x, ~ alpha * .y + (1 - alpha) * .x)
+}
+
+```
+
+
+```{r AFL Data}
+##Extract Data spanning the past decade
+current_year <- as.numeric(format(Sys.Date(), "%Y"))
+seasons <- 2016:current_year
+data_player <- map_dfr(seasons, ~ fetch_player_stats(season = .x))
+
+##Get AFL fixture to help determine opponent team 
+fixtures <- fetch_fixture(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS") %>%
+  dplyr::select(providerId, home.team.name, away.team.name)
+
+
+##Extract AFL Lineup data of games that haven't happened
+afl_lineups <- fetch_lineup_afl(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS") %>%
+  left_join(fixtures, by="providerId") %>%
+  mutate(year = year(utcStartTime),
+         opponent = case_when(
+           teamType == 'home' & teamName == home.team.name ~ away.team.name,
+           teamType == 'away' & teamName == away.team.name ~ home.team.name
+         ),
+         venue = venue.name) %>%
+  dplyr::select(providerId,
+                status,
+                player.playerId,
+                player.playerName.givenName, 
+                player.playerName.surname,
+                position,
+                year,
+                round.roundNumber,
+                teamName,
+                opponent,
+                venue
+                )
+
+## Extract total cbas in a game
+#cba attended/total clearance per game to get percentage
+ttl_cba_per_match <- data_player %>%
+group_by(providerId) %>%
+  summarise(
+  total_cbs = sum( clearances.centreClearances, na.rm = TRUE),
+  .groups = "drop")
+
+
+## Create dataframe that will be binded onto player stats disposals
+# Align afl_lineups columns to match player_stats_disposals schema
+future_games <- afl_lineups %>%
+  mutate(
+    player.givenName                        = player.playerName.givenName,
+    player.surname                          = player.playerName.surname,
+    player.player.position                  = position,
+    team.name                               = teamName,
+    disposals                               = NA_real_,
+    inside50s  = NA_real_,
+    clearances.totalClearances             = NA_real_,
+    timeOnGroundPercentage                  = NA_real_,
+    CBA_prop    = NA_real_,
+    extendedStats.pressureActs              = NA_real_,
+    extendedStats.defHalfPressureActs       = NA_real_,
+    contestedPossessions = NA_real_,
+    uncontestedPossessions = NA_real_,
+    extendedStats.groundBallGets = NA_real_,
+    metresGained = NA_real_
+  ) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.playerId,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    disposals,
+    clearances.totalClearances,
+    inside50s,
+    timeOnGroundPercentage,
+    CBA_prop,
+    #Following below is used for team stats
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets,
+    metresGained
+  )
+
+
+
+##Get the disposal stats
+player_stats_disposals_concluded <- data_player  %>%
+  left_join(ttl_cba_per_match, by = c("providerId")) %>%
+  filter(status == "CONCLUDED" | status == "CONFIRMED_TEAMS" ) %>%
+  mutate(year = year(utcStartTime),
+         CBA_prop = (extendedStats.centreBounceAttendances/total_cbs) * 100,
+         opponent = case_when(
+           teamStatus == 'home' & team.name == home.team.name ~ away.team.name,
+           teamStatus == 'away' & team.name == away.team.name ~ home.team.name
+         ),
+    venue = venue.name) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.playerId,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    disposals,
+    inside50s,
+    clearances.totalClearances,
+    timeOnGroundPercentage,
+    CBA_prop,
+    #Following below is used for team stats
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets,
+    metresGained
+    
+  )
+
+# Bind into the main dataframe
+player_stats_disposals <- bind_rows(player_stats_disposals_concluded, future_games)
+
+```
+
+```{r feature_engineering}
+##conduct feature engineering on the data that will be trained on
+
+##Use lag function to get prior game disposal
+player_stats_disposals <- player_stats_disposals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    disp_lag = lag(disposals),
+    inside50s_lag = lag(inside50s),
+    totalClearances_lag = lag(clearances.totalClearances),
+    cba_lag = lag(CBA_prop),
+    tog_lag = lag(timeOnGroundPercentage),
+    cp_lag = lag(contestedPossessions),
+    ucp_lag = lag(uncontestedPossessions),
+    gbg_lag = lag(extendedStats.groundBallGets),
+    mg_lag = lag(metresGained)
+    
+  )
+
+##Calculate averages and use lag to shift prior
+player_stats_disposals <- player_stats_disposals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    ewma_disp_lag    = replace(disp_lag, !is.na(disp_lag), calc_ewma(disp_lag[!is.na(disp_lag)])),
+    ewma_inside50s_lag    = replace(inside50s_lag, !is.na(inside50s_lag), calc_ewma(inside50s_lag[!is.na(inside50s_lag)])),
+    ewma_totalClearances_lag  = replace(totalClearances_lag, !is.na(totalClearances_lag), calc_ewma(totalClearances_lag[!is.na(totalClearances_lag)])),
+    ewma_TOG_lag     = replace(tog_lag, !is.na(tog_lag), calc_ewma(tog_lag[!is.na(tog_lag)])),
+    ewma_cba_lag     = replace(cba_lag, !is.na(cba_lag), calc_ewma(cba_lag[!is.na(cba_lag)])),
+    avg_disp_last5   = lag(slide_dbl(disp_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    var_disp_last5   = lag(slide_dbl(disp_lag, ~ var(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_inside50s_last5   = lag(slide_dbl(inside50s_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_totalClearances_last5   = lag(slide_dbl(totalClearances_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_TOG_last5   = lag(slide_dbl(tog_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_cba_last5   = lag(slide_dbl(cba_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_disp_last3   = lag(slide_dbl(disp_lag, ~ mean(.x, na.rm = TRUE), .before = 2, .complete = FALSE)),
+    var_disp_last3   = lag(slide_dbl(disp_lag, ~ var(.x, na.rm = TRUE), .before = 2, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+
+opponent_defensive_profile <- player_stats_disposals %>%      # exclude future game rows
+  group_by(year, round.roundNumber, opponent) %>%
+  summarise(
+    disp_conceded          = sum(disp_lag,                       na.rm = TRUE),
+    cont_poss_conceded     = sum(cp_lag,            na.rm = TRUE),
+    uncont_poss_conceded   = sum(ucp_lag,          na.rm = TRUE),
+    gbg_conceded           = sum(gbg_lag,    na.rm = TRUE),
+    metres_gained_conceded = sum(mg_lag,      na.rm = TRUE),
+    .groups = "drop"
+  )
+
+library(slider)
+
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  arrange(opponent, year, round.roundNumber) %>%
+  group_by(opponent, year) %>%
+  mutate(
+    # Rolling 5 game average for each stat
+    avg_disp_conceded          = lag(slide_dbl(disp_conceded,          ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_cont_poss_conceded     = lag(slide_dbl(cont_poss_conceded,     ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_uncont_poss_conceded   = lag(slide_dbl(uncont_poss_conceded,   ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_gbg_conceded           = lag(slide_dbl(gbg_conceded,           ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_metres_gained_conceded = lag(slide_dbl(metres_gained_conceded, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+
+league_avgs <- opponent_defensive_profile %>%
+  filter(!is.na(avg_disp_conceded)) %>%
+  summarise(
+    league_disp          = mean(disp_conceded,          na.rm = TRUE),
+    league_cont_poss     = mean(cont_poss_conceded,     na.rm = TRUE),
+    league_uncont_poss   = mean(uncont_poss_conceded,   na.rm = TRUE),
+    league_gbg           = mean(gbg_conceded,           na.rm = TRUE),
+    league_metres_gained = mean(metres_gained_conceded, na.rm = TRUE)
+  )
+
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  mutate(
+    opp_disp_factor          = avg_disp_conceded          / league_avgs$league_disp,
+    opp_cont_poss_factor     = avg_cont_poss_conceded     / league_avgs$league_cont_poss,
+    opp_uncont_poss_factor   = avg_uncont_poss_conceded   / league_avgs$league_uncont_poss,
+    opp_gbg_factor           = avg_gbg_conceded           / league_avgs$league_gbg,
+    opp_metres_gained_factor = avg_metres_gained_conceded / league_avgs$league_metres_gained
+  ) %>%
+  dplyr::select(
+    year, round.roundNumber, opponent,
+    opp_disp_factor,
+    opp_cont_poss_factor,
+    opp_uncont_poss_factor,
+    opp_gbg_factor,
+    opp_metres_gained_factor
+  )
+
+player_stats_disposals <- player_stats_disposals %>%
+  left_join(
+    opponent_defensive_profile,
+    by = c("opponent", "year", "round.roundNumber")
+  )
+
+```
+
+```{r}
+##Final Data Output
+
+
+new_data <- player_stats_disposals %>%
+  filter(status != "CONCLUDED") %>% 
+  dplyr::select(player.playerId,player.givenName, player.surname, 
+         player.player.position, year, round.roundNumber, opponent, venue, disposals,
+         disp_lag, cba_lag, tog_lag, totalClearances_lag, inside50s_lag,
+         ewma_TOG_lag, ewma_disp_lag, ewma_cba_lag, ewma_inside50s_lag, ewma_totalClearances_lag, 
+         avg_disp_last5, avg_cba_last5, avg_TOG_last5, avg_inside50s_last5, avg_totalClearances_last5,
+        var_disp_last5, avg_disp_last3,
+        var_disp_last3, opp_disp_factor, opp_cont_poss_factor, opp_uncont_poss_factor,
+        opp_gbg_factor, opp_metres_gained_factor)
+
+```
+
+
+```{r}
+##XGBoost Model
+library(xgboost)
+library(dplyr)
+library(tidyr)
+model_xgb <- xgb.load("model_xgb_final.ubj")
+
+sys <- readRDS("xgb_system.rds")
+
+features_xgb <- sys$features_xgb
+sigma_xgb_norm <- sys$sigma_xgb_norm
+opp_levels <- sys$opp_levels_xgb
+pos_levels <- sys$pos_levels_xgb
+venue_levels <- sys$venue_levels_xgb
+
+new_data <- new_data %>%
+  mutate(
+    position_encoded = as.numeric(factor(player.player.position, levels = pos_levels)),
+    venue_encoded    = as.numeric(factor(venue,     levels = venue_levels)),
+    opp_encoded      = as.numeric(factor(opponent,  levels = opp_levels))
+  )
+
+new_data <- new_data %>%
+  mutate(
+    confidence_flag = case_when(
+      is.na(ewma_disp_lag)  ~ "no_history",
+      is.na(avg_disp_last3) ~ "insufficient_history",
+      is.na(avg_disp_last5) ~ "insufficient_history",
+      TRUE                  ~ "ok"
+    )
+  )
+
+# ── 2. Create DMatrix (no label needed for prediction) ────────────────────────
+new_matrix <- xgb.DMatrix(
+  data = as.matrix(new_data[, features_xgb])
+)
+
+# ── 3. Predict lambda (expected disposal count) ───────────────────────────────
+lambda_new <- predict(model_xgb, new_matrix)
+
+
+
+# ── Define lines ──────────────────────────────────────────────────────────────
+lines <- 10:30
+
+# ── Generate probabilities for each line ─────────────────────────────────────
+prob_table <- lapply(lines, function(l) {
+  new_data %>%
+    mutate(
+      line           = l,
+      prob_over_norm = pnorm(l - 0.5, mean = lambda_new, sd = sigma_xgb_norm, lower.tail = FALSE),
+      decimal_odds   = 1 / prob_over_norm,
+    ) %>%
+    dplyr::select(player.givenName, player.surname, opponent, line,
+                  prob_over_norm, decimal_odds, confidence_flag)
+}) %>%
+  bind_rows()
+
+# ── Point prediction — one row per player ─────────────────────────────────────
+point_predictions <- new_data %>%
+  mutate(predicted_disposals = round(lambda_new, 1)) %>%
+  dplyr::select(player.givenName, player.surname, opponent, predicted_disposals)
+
+# ── Get Sportsbet odds ────────────────────────────────────────────────────────
+event_ids   <- sportsbet_eventid_extractor()
+all_markets <- bind_rows(map(event_ids$event_id, sportsbet_Scraper))
+
+# ── Get PointsBet odds ────────────────────────────────────────────────────────
+pb_raw <- pointsbet_scraper()
+
+# ── Pivot model wide ──────────────────────────────────────────────────────────
+prob_table_wide <- prob_table %>%
+  dplyr::select(player.givenName, player.surname, opponent,
+                line, decimal_odds, confidence_flag) %>%
+  pivot_wider(
+    names_from   = line,
+    values_from  = decimal_odds,
+    names_prefix = "line_"
+  ) %>%
+  # ── Join point prediction onto wide table ─────────────────────────────────
+  left_join(point_predictions, by = c("player.givenName", "player.surname", "opponent"))
+
+# ── Clean Sportsbet odds ──────────────────────────────────────────────────────
+clean_odds <- extract_afl_props(all_markets) %>%
+  mutate(fair_odds = 1 / ((1 / odds) / 1.08))
+
+clean_odds_wide <- clean_odds %>%
+  mutate(
+    line      = as.numeric(str_extract(market, "\\d+")),
+    full_name = selection_name
+  ) %>%
+  filter(
+    stat == "disposals",
+    str_detect(market, "^\\d+\\+\\s*[Dd]isposals$")
+  ) %>%
+  mutate(
+    player.givenName = str_extract(full_name, "^\\S+"),
+    player.surname   = str_remove(full_name,  "^\\S+\\s+")
+  ) %>%
+  dplyr::select(player.givenName, player.surname, line, odds) %>%
+  pivot_wider(
+    names_from  = line,
+    values_from = c(odds),
+    names_glue  = "{.value}_{line}"
+  ) %>%
+  rename_with(~ str_replace(., "^odds_", "sportsbet_odds_"), starts_with("odds_"))
+
+# ── Clean PointsBet odds ──────────────────────────────────────────────────────
+clean_odds_pb_wide <- pb_raw %>%
+  filter(str_detect(market, "^To Get Disposals")) %>%
+  mutate(
+    line      = as.numeric(str_extract(selection, "\\d+(?=\\+)")),
+    full_name = selection %>%
+      str_squish() %>%
+      str_remove_all(regex("\\b(over\\s*)?\\d+\\+?", ignore_case = TRUE)) %>%
+      str_remove_all("[-–]") %>%
+      str_squish(),
+    name_parts       = str_split(full_name, "\\s+"),
+    player.givenName = sapply(name_parts, `[`, 1),
+    player.surname   = sapply(name_parts, function(x) {
+      if (length(x) > 1) paste(x[-1], collapse = " ") else NA_character_
+    })
+  ) %>%
+  filter(type == "Other", !is.na(line), !is.na(odds)) %>%
+  dplyr::select(player.givenName, player.surname, line, odds) %>%
+  pivot_wider(
+    names_from  = line,
+    values_from = odds,
+    names_glue  = "pb_odds_{line}"
+  )
+
+# ── Join all sources ──────────────────────────────────────────────────────────
+comparison <- prob_table_wide %>%
+  left_join(clean_odds_wide,    by = c("player.givenName", "player.surname")) %>%
+  left_join(clean_odds_pb_wide, by = c("player.givenName", "player.surname")) %>%
+  filter(confidence_flag == "ok")
+
+# ── Derive common lines per bookmaker ─────────────────────────────────────────
+model_lines <- as.numeric(str_extract(
+  colnames(comparison)[str_detect(colnames(comparison), "^line_\\d+")], "\\d+"))
+
+sportsbet_lines <- as.numeric(str_extract(
+  colnames(comparison)[str_detect(colnames(comparison), "^sportsbet_odds_\\d+")], "\\d+"))
+
+pb_lines <- as.numeric(str_extract(
+  colnames(comparison)[str_detect(colnames(comparison), "^pb_odds_\\d+")], "\\d+"))
+
+common_lines_sb <- intersect(model_lines, sportsbet_lines)
+common_lines_pb <- intersect(model_lines, pb_lines)
+
+# ── Calculate EV — Sportsbet ──────────────────────────────────────────────────
+for (l in common_lines_sb) {
+  model_col     <- paste0("line_", l)
+  sportsbet_col <- paste0("sportsbet_odds_", l)
+  ev_col        <- paste0("ev_sb_", l)
+
+  comparison <- comparison %>%
+    mutate(
+      !!ev_col := (1 / .data[[model_col]]) * (.data[[sportsbet_col]] - 1) -
+                 (1 - (1 / .data[[model_col]])) * 1
+    )
+}
+
+# ── Calculate EV — PointsBet ──────────────────────────────────────────────────
+for (l in common_lines_pb) {
+  model_col <- paste0("line_", l)
+  pb_col    <- paste0("pb_odds_", l)
+  ev_col    <- paste0("ev_pb_", l)
+
+  comparison <- comparison %>%
+    mutate(
+      !!ev_col := (1 / .data[[model_col]]) * (.data[[pb_col]] - 1) -
+                 (1 - (1 / .data[[model_col]])) * 1
+    )
+}
+
+# ── Pivot model odds long ─────────────────────────────────────────────────────
+model_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, opponent,
+                predicted_disposals, starts_with("line_")) %>%
+  pivot_longer(
+    cols         = starts_with("line_"),
+    names_to     = "line",
+    values_to    = "model_odds",
+    names_prefix = "line_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot Sportsbet odds long ─────────────────────────────────────────────────
+sportsbet_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("sportsbet_odds_")) %>%
+  pivot_longer(
+    cols         = starts_with("sportsbet_odds_"),
+    names_to     = "line",
+    values_to    = "sportsbet_odds",
+    names_prefix = "sportsbet_odds_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot PointsBet odds long ─────────────────────────────────────────────────
+pb_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("pb_odds_")) %>%
+  pivot_longer(
+    cols         = starts_with("pb_odds_"),
+    names_to     = "line",
+    values_to    = "pb_odds",
+    names_prefix = "pb_odds_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot EV long — Sportsbet ─────────────────────────────────────────────────
+ev_sb_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("ev_sb_")) %>%
+  pivot_longer(
+    cols         = starts_with("ev_sb_"),
+    names_to     = "line",
+    values_to    = "ev_sportsbet",
+    names_prefix = "ev_sb_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot EV long — PointsBet ─────────────────────────────────────────────────
+ev_pb_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("ev_pb_")) %>%
+  pivot_longer(
+    cols         = starts_with("ev_pb_"),
+    names_to     = "line",
+    values_to    = "ev_pb",
+    names_prefix = "ev_pb_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Join all and filter positive EV ──────────────────────────────────────────
+comparison_long <- model_long %>%
+  left_join(sportsbet_long, by = c("player.givenName", "player.surname", "line")) %>%
+  left_join(pb_long,        by = c("player.givenName", "player.surname", "line")) %>%
+  left_join(ev_sb_long,     by = c("player.givenName", "player.surname", "line")) %>%
+  left_join(ev_pb_long,     by = c("player.givenName", "player.surname", "line")) %>%
+  filter(!is.na(ev_sportsbet) | !is.na(ev_pb)) %>%
+  filter(ev_sportsbet > 0 | ev_pb > 0) %>%
+  dplyr::select(player.givenName, player.surname, opponent,
+                predicted_disposals, line,
+                model_odds, sportsbet_odds, ev_sportsbet,
+                pb_odds, ev_pb) %>%
+  arrange(desc(pmax(ev_sportsbet, ev_pb, na.rm = TRUE)))
+
+print(comparison_long, n = Inf)
+
+#print(comparison_long, n = Inf)
+```
+
+
+
+```{r}
+write.csv(prob_table_wide, "afl_disp_prob.csv", row.names = FALSE)
+write.csv(comparison_long, "EV_Disp.csv", row.names = FALSE)
+
+
+```

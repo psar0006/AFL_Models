@@ -1,0 +1,984 @@
+---
+title: "AFL Betting"
+output: html_document
+date: "2026-03-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(fitzRoy)
+library(dplyr)
+library(purrr)
+library(lubridate)
+library(slider)
+library(tidyr)
+```
+
+## R Markdown
+
+```{r EWMA}
+library(purrr)
+
+calc_ewma <- function(x, alpha = 0.7) {
+  if (length(x) == 0) return(numeric(0))
+  accumulate(x, ~ alpha * .y + (1 - alpha) * .x)
+}
+
+```
+
+
+```{r AFL Data}
+##Extract Data spanning the past decade
+current_year <- as.numeric(format(Sys.Date(), "%Y"))
+seasons <- 2016:current_year
+data_player <- map_dfr(seasons, ~ fetch_player_stats(season = .x))
+
+##Get AFL fixture to help determine opponent team 
+fixtures <- fetch_fixture(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS") %>%
+  dplyr::select(providerId, home.team.name, away.team.name)
+
+
+##Extract AFL Lineup data of games that haven't happened
+afl_lineups <- fetch_lineup_afl(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS") %>%
+  left_join(fixtures, by="providerId") %>%
+  mutate(year = year(utcStartTime),
+         opponent = case_when(
+           teamType == 'home' & teamName == home.team.name ~ away.team.name,
+           teamType == 'away' & teamName == away.team.name ~ home.team.name
+         ),
+         venue = venue.name) %>%
+  dplyr::select(providerId,
+                status,
+                player.playerId,
+                player.playerName.givenName, 
+                player.playerName.surname,
+                position,
+                year,
+                round.roundNumber,
+                teamName,
+                opponent,
+                venue
+                )
+
+## Extract total cbas in a game
+#cba attended/total clearance per game to get percentage
+ttl_cba_per_match <- data_player %>%
+group_by(providerId) %>%
+  summarise(
+  total_cbs = sum( clearances.centreClearances, na.rm = TRUE),
+  .groups = "drop")
+
+
+## Create dataframe that will be binded onto player stats disposals
+# Align afl_lineups columns to match player_stats_disposals schema
+future_games <- afl_lineups %>%
+  mutate(
+    player.givenName                        = player.playerName.givenName,
+    player.surname                          = player.playerName.surname,
+    player.player.position                  = position,
+    team.name                               = teamName,
+    disposals                               = NA_real_,
+    inside50s  = NA_real_,
+    clearances.totalClearances             = NA_real_,
+    timeOnGroundPercentage                  = NA_real_,
+    CBA_prop    = NA_real_,
+    extendedStats.pressureActs              = NA_real_,
+    extendedStats.defHalfPressureActs       = NA_real_,
+    contestedPossessions = NA_real_,
+    uncontestedPossessions = NA_real_,
+    extendedStats.groundBallGets = NA_real_,
+    metresGained = NA_real_
+  ) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.playerId,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    disposals,
+    clearances.totalClearances,
+    inside50s,
+    timeOnGroundPercentage,
+    CBA_prop,
+    #Following below is used for team stats
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets,
+    metresGained
+  )
+
+
+
+##Get the disposal stats
+player_stats_disposals_concluded <- data_player  %>%
+  left_join(ttl_cba_per_match, by = c("providerId")) %>%
+  filter(status == "CONCLUDED" | status == "CONFIRMED_TEAMS" ) %>%
+  mutate(year = year(utcStartTime),
+         CBA_prop = (extendedStats.centreBounceAttendances/total_cbs) * 100,
+         opponent = case_when(
+           teamStatus == 'home' & team.name == home.team.name ~ away.team.name,
+           teamStatus == 'away' & team.name == away.team.name ~ home.team.name
+         ),
+    venue = venue.name) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.playerId,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    disposals,
+    inside50s,
+    clearances.totalClearances,
+    timeOnGroundPercentage,
+    CBA_prop,
+    #Following below is used for team stats
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets,
+    metresGained
+    
+  )
+
+# Bind into the main dataframe
+player_stats_disposals <- bind_rows(player_stats_disposals_concluded, future_games)
+
+```
+
+```{r feature_engineering}
+##conduct feature engineering on the data that will be trained on
+
+##Use lag function to get prior game disposal
+player_stats_disposals <- player_stats_disposals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    disp_lag = lag(disposals),
+    inside50s_lag = lag(inside50s),
+    totalClearances_lag = lag(clearances.totalClearances),
+    cba_lag = lag(CBA_prop),
+    tog_lag = lag(timeOnGroundPercentage),
+    cp_lag = lag(contestedPossessions),
+    ucp_lag = lag(uncontestedPossessions),
+    gbg_lag = lag(extendedStats.groundBallGets),
+    mg_lag = lag(metresGained)
+    
+  )
+
+##Calculate averages and use lag to shift prior
+player_stats_disposals <- player_stats_disposals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    ewma_disp_lag    = replace(disp_lag, !is.na(disp_lag), calc_ewma(disp_lag[!is.na(disp_lag)])),
+    ewma_inside50s_lag    = replace(inside50s_lag, !is.na(inside50s_lag), calc_ewma(inside50s_lag[!is.na(inside50s_lag)])),
+    ewma_totalClearances_lag  = replace(totalClearances_lag, !is.na(totalClearances_lag), calc_ewma(totalClearances_lag[!is.na(totalClearances_lag)])),
+    ewma_TOG_lag     = replace(tog_lag, !is.na(tog_lag), calc_ewma(tog_lag[!is.na(tog_lag)])),
+    ewma_cba_lag     = replace(cba_lag, !is.na(cba_lag), calc_ewma(cba_lag[!is.na(cba_lag)])),
+    avg_disp_last5   = lag(slide_dbl(disp_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    var_disp_last5   = lag(slide_dbl(disp_lag, ~ var(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_inside50s_last5   = lag(slide_dbl(inside50s_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_totalClearances_last5   = lag(slide_dbl(totalClearances_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_TOG_last5   = lag(slide_dbl(tog_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_cba_last5   = lag(slide_dbl(cba_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_disp_last3   = lag(slide_dbl(disp_lag, ~ mean(.x, na.rm = TRUE), .before = 2, .complete = FALSE)),
+    var_disp_last3   = lag(slide_dbl(disp_lag, ~ var(.x, na.rm = TRUE), .before = 2, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+
+opponent_defensive_profile <- player_stats_disposals %>%      # exclude future game rows
+  group_by(year, round.roundNumber, opponent) %>%
+  summarise(
+    disp_conceded          = sum(disp_lag,                       na.rm = TRUE),
+    cont_poss_conceded     = sum(cp_lag,            na.rm = TRUE),
+    uncont_poss_conceded   = sum(ucp_lag,          na.rm = TRUE),
+    gbg_conceded           = sum(gbg_lag,    na.rm = TRUE),
+    metres_gained_conceded = sum(mg_lag,      na.rm = TRUE),
+    .groups = "drop"
+  )
+
+library(slider)
+
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  arrange(opponent, year, round.roundNumber) %>%
+  group_by(opponent, year) %>%
+  mutate(
+    # Rolling 5 game average for each stat
+    avg_disp_conceded          = lag(slide_dbl(disp_conceded,          ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_cont_poss_conceded     = lag(slide_dbl(cont_poss_conceded,     ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_uncont_poss_conceded   = lag(slide_dbl(uncont_poss_conceded,   ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_gbg_conceded           = lag(slide_dbl(gbg_conceded,           ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_metres_gained_conceded = lag(slide_dbl(metres_gained_conceded, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+
+league_avgs <- opponent_defensive_profile %>%
+  filter(!is.na(avg_disp_conceded)) %>%
+  summarise(
+    league_disp          = mean(disp_conceded,          na.rm = TRUE),
+    league_cont_poss     = mean(cont_poss_conceded,     na.rm = TRUE),
+    league_uncont_poss   = mean(uncont_poss_conceded,   na.rm = TRUE),
+    league_gbg           = mean(gbg_conceded,           na.rm = TRUE),
+    league_metres_gained = mean(metres_gained_conceded, na.rm = TRUE)
+  )
+
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  mutate(
+    opp_disp_factor          = avg_disp_conceded          / league_avgs$league_disp,
+    opp_cont_poss_factor     = avg_cont_poss_conceded     / league_avgs$league_cont_poss,
+    opp_uncont_poss_factor   = avg_uncont_poss_conceded   / league_avgs$league_uncont_poss,
+    opp_gbg_factor           = avg_gbg_conceded           / league_avgs$league_gbg,
+    opp_metres_gained_factor = avg_metres_gained_conceded / league_avgs$league_metres_gained
+  ) %>%
+  dplyr::select(
+    year, round.roundNumber, opponent,
+    opp_disp_factor,
+    opp_cont_poss_factor,
+    opp_uncont_poss_factor,
+    opp_gbg_factor,
+    opp_metres_gained_factor
+  )
+
+player_stats_disposals <- player_stats_disposals %>%
+  left_join(
+    opponent_defensive_profile,
+    by = c("opponent", "year", "round.roundNumber")
+  )
+
+```
+
+
+```{r}
+##Final Data Output
+
+
+player_stats_disposals_concluded <- player_stats_disposals %>%
+  filter(status == "CONCLUDED") %>% 
+  dplyr::select(player.playerId,player.givenName, player.surname, 
+         player.player.position, year, round.roundNumber, opponent, venue, disposals,
+         disp_lag, cba_lag, tog_lag, totalClearances_lag, inside50s_lag,
+         ewma_TOG_lag, ewma_disp_lag, ewma_cba_lag, ewma_inside50s_lag, ewma_totalClearances_lag, 
+         avg_disp_last5, avg_cba_last5, avg_TOG_last5, avg_inside50s_last5, avg_totalClearances_last5,
+        var_disp_last5, avg_disp_last3,
+        var_disp_last3, opp_disp_factor, opp_cont_poss_factor, opp_uncont_poss_factor,
+        opp_gbg_factor, opp_metres_gained_factor) %>%
+  drop_na()
+
+```
+
+
+
+
+```{r}
+##Model Development
+
+
+##Standard negative binomial model
+library(MASS)
+
+# ── Sort by time ──────────────────────────────────────────────────────────────
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  arrange(year, round.roundNumber)
+
+# ── Train/test split ──────────────────────────────────────────────────────────
+train <- player_stats_disposals_concluded %>% slice_head(prop = 0.9)
+test  <- player_stats_disposals_concluded %>% slice_tail(prop = 0.1)
+
+# ── Save known levels from train ──────────────────────────────────────────────
+known_opponents <- levels(as.factor(train$opponent))
+known_venues    <- levels(as.factor(train$venue))
+known_positions <- levels(as.factor(train$player.player.position))
+
+# ── Apply to train — add Unknown as a level even if unused ───────────────────
+train <- train %>%
+  mutate(
+    opponent               = factor(opponent,               levels = c(known_opponents, "Unknown")),
+    venue                  = factor(venue,                  levels = c(known_venues,    "Unknown")),
+    player.player.position = factor(player.player.position, levels = c(known_positions, "Unknown"))
+  )
+
+# ── Fit model ─────────────────────────────────────────────────────────────────
+model_nb <- glm.nb(
+  disposals ~ player.player.position + opponent + venue +
+    ewma_TOG_lag + ewma_disp_lag + ewma_cba_lag +
+    avg_disp_last5 + var_disp_last5 + avg_disp_last3 +
+    disp_lag + cba_lag + tog_lag +
+    avg_inside50s_last5 + avg_totalClearances_last5 +
+    avg_cba_last5 + avg_TOG_last5 +
+    ewma_inside50s_lag + ewma_totalClearances_lag +
+    opp_disp_factor + opp_cont_poss_factor + opp_uncont_poss_factor +
+    opp_gbg_factor + opp_metres_gained_factor,
+  data = train
+)
+
+# ── Coerce unseen levels in test to Unknown ───────────────────────────────────
+test <- test %>%
+  mutate(
+    opponent = ifelse(opponent %in% known_opponents, opponent, "Unknown"),
+    venue    = ifelse(venue    %in% known_venues,    venue,    "Unknown"),
+    player.player.position = ifelse(
+      player.player.position %in% known_positions,
+      player.player.position, "Unknown"
+    ),
+    opponent               = factor(opponent,               levels = c(known_opponents, "Unknown")),
+    venue                  = factor(venue,                  levels = c(known_venues,    "Unknown")),
+    player.player.position = factor(player.player.position, levels = c(known_positions, "Unknown"))
+  )
+
+
+# ── Predict on test ───────────────────────────────────────────────────────────
+lambda_test <- predict(model_nb, newdata = test, type = "response")
+
+
+
+## XGBoost Model + Dynamic Sigma
+
+library(xgboost)
+library(dplyr)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
+
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  mutate(
+    position_encoded = as.numeric(as.factor(player.player.position)),
+    venue_encoded    = as.numeric(as.factor(venue)),
+    opp_encoded      = as.numeric(as.factor(opponent))
+  )
+
+features_encoded <- c(
+  "ewma_disp_lag","avg_disp_last5","avg_disp_last3",
+  "ewma_TOG_lag","ewma_cba_lag","ewma_inside50s_lag",
+  "ewma_totalClearances_lag","avg_inside50s_last5",
+  "avg_totalClearances_last5","avg_cba_last5","avg_TOG_last5",
+  "disp_lag","cba_lag","tog_lag",
+  "var_disp_last5","var_disp_last3",
+  "opp_disp_factor","opp_cont_poss_factor","opp_uncont_poss_factor",
+  "opp_gbg_factor","opp_metres_gained_factor",
+  "position_encoded","venue_encoded","opp_encoded"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. TRAIN / TEST SPLIT
+# ─────────────────────────────────────────────────────────────────────────────
+
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  arrange(year, round.roundNumber)
+
+train <- player_stats_disposals_concluded %>% slice_head(prop = 0.9)
+test  <- player_stats_disposals_concluded %>% slice_tail(prop = 0.1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. BASE MODEL (MEAN)
+# ─────────────────────────────────────────────────────────────────────────────
+
+train_matrix <- xgb.DMatrix(
+  data  = as.matrix(train[, features_encoded]),
+  label = train$disposals
+)
+
+test_matrix <- xgb.DMatrix(
+  data  = as.matrix(test[, features_encoded]),
+  label = test$disposals
+)
+
+params <- list(
+  objective        = "count:poisson",
+  eta              = 0.05,
+  max_depth        = 5,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 10
+)
+
+model_xgb <- xgb.train(
+  params                = params,
+  data                  = train_matrix,
+  nrounds               = 1000,
+  watchlist             = list(train = train_matrix, test = test_matrix),
+  early_stopping_rounds = 30,
+  verbose               = 1
+)
+
+# Predictions
+lambda_train <- predict(model_xgb, train_matrix)
+lambda_test  <- predict(model_xgb, test_matrix)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. DYNAMIC SIGMA MODEL (SQUARED RESIDUALS → SQRT)
+# ─────────────────────────────────────────────────────────────────────────────
+
+train_sigma <- train %>%
+  mutate(
+    lambda          = lambda_train,
+    squared_residual = (disposals - lambda_train)^2  # predict variance, then sqrt
+  )
+
+sigma_matrix_train <- xgb.DMatrix(
+  data  = as.matrix(train_sigma[, features_encoded]),
+  label = train_sigma$squared_residual
+)
+
+sigma_matrix_test <- xgb.DMatrix(
+  data  = as.matrix(test[, features_encoded])
+)
+
+sigma_model <- xgb.train(
+  params = list(
+    objective        = "reg:squarederror",
+    eta              = 0.05,
+    max_depth        = 3,        # shallower than mean model to avoid overfit
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 20        # higher than mean model — variance needs more data
+  ),
+  data    = sigma_matrix_train,
+  nrounds = 500,
+  verbose = 0
+)
+
+# ── Predict variance then sqrt to get sigma ───────────────────────────────────
+sigma_test  <- sqrt(pmax(predict(sigma_model, sigma_matrix_test),  0))
+sigma_train <- sqrt(pmax(predict(sigma_model, sigma_matrix_train), 0))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. STABILISATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+sigma_global <- sd(train$disposals - lambda_train)
+
+# Tune blend weight rather than hardcoding 0.7/0.3
+# Higher alpha = more trust in dynamic sigma
+alpha <- 0.6  
+
+sigma_test  <- pmax(alpha * sigma_test  + (1 - alpha) * sigma_global, 1)
+sigma_train <- pmax(alpha * sigma_train + (1 - alpha) * sigma_global, 1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. CALIBRATION AWARE SIGMA TUNING
+# ─────────────────────────────────────────────────────────────────────────────
+# Rather than arbitrary alpha, find the alpha that minimises calibration error
+
+best_alpha <- NULL
+best_cal_error <- Inf
+
+for (alpha in seq(0.3, 0.9, by = 0.1)) {
+  
+  sigma_candidate <- pmax(
+    alpha * sqrt(pmax(predict(sigma_model, sigma_matrix_test), 0)) + 
+    (1 - alpha) * sigma_global, 1
+  )
+  
+  cal_error <- mean(sapply(c(15, 20, 25, 30), function(l) {
+    pred_prob   <- mean(pnorm(l - 0.5, mean = lambda_test, 
+                              sd = sigma_candidate, lower.tail = FALSE))
+    actual_rate <- mean(test$disposals >= l)
+    (pred_prob - actual_rate)^2
+  }))
+  
+  if (cal_error < best_cal_error) {
+    best_cal_error <- cal_error
+    best_alpha     <- alpha
+  }
+}
+
+cat("Best alpha: ", best_alpha, "\n")
+cat("Best calibration error: ", round(best_cal_error, 6), "\n")
+
+# ── Apply best alpha ──────────────────────────────────────────────────────────
+sigma_test <- pmax(
+  best_alpha * sqrt(pmax(predict(sigma_model, sigma_matrix_test), 0)) +
+  (1 - best_alpha) * sigma_global, 1
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. FINAL OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+test <- test %>%
+  mutate(
+    lambda_xgb    = lambda_test,
+    sigma_xgb_dyn = sigma_test,
+    residuals_xgb = disposals - lambda_xgb
+  )
+
+cat("Dynamic Sigma (mean): ", round(mean(sigma_test), 4), "\n")
+cat("Global Sigma:         ", round(sigma_global,     4), "\n")
+```
+
+```{r}
+library(ggplot2)
+library(shapviz)
+library(patchwork)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. PREP (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+theta_nb       <- model_nb$theta
+lambda_nb      <- lambda_test
+lambda_xgb     <- lambda_test
+sigma_xgb_norm <- sd(test$disposals - lambda_xgb)
+
+theta_xgb_nb <- fitdistr(
+  test$disposals,
+  "negative binomial",
+  start = list(mu = mean(lambda_xgb), size = 10)
+)$estimate["size"]
+
+test <- test %>%
+  mutate(
+    lambda_nb     = lambda_nb,
+    lambda_xgb    = lambda_xgb,
+    sigma_xgb_dyn = sigma_xgb_dyn,
+    residuals_nb  = disposals - lambda_nb,
+    residuals_xgb = disposals - lambda_xgb
+  )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. POINT METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+eval_point <- function(res) {
+  c(MAE  = mean(abs(res), na.rm = TRUE),
+    RMSE = sqrt(mean(res^2, na.rm = TRUE)),
+    MBE  = mean(res, na.rm = TRUE))
+}
+
+point_metrics <- bind_rows(
+  as.data.frame(t(eval_point(test$residuals_nb)))  %>% mutate(model = "glm.nb"),
+  as.data.frame(t(eval_point(test$residuals_xgb))) %>% mutate(model = "XGB")
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. CALIBRATION
+# ─────────────────────────────────────────────────────────────────────────────
+lines_eval <- c(15, 20, 25, 30)
+
+calibrate_nb <- function(lambdas, theta, label) {
+  bind_rows(lapply(lines_eval, function(l) {
+    tibble(
+      model         = label,
+      line          = l,
+      avg_pred_prob = mean(pnbinom(l - 1, size = theta,
+                                   mu = lambdas, lower.tail = FALSE)),
+      actual_rate   = mean(test$disposals >= l),
+      n             = nrow(test)
+    )
+  }))
+}
+
+calibrate_norm <- function(lambdas, sigma, label) {
+  bind_rows(lapply(lines_eval, function(l) {
+    tibble(
+      model         = label,
+      line          = l,
+      avg_pred_prob = mean(pnorm(l - 0.5, mean = lambdas,
+                                 sd = sigma, lower.tail = FALSE)),
+      actual_rate   = mean(test$disposals >= l),
+      n             = nrow(test)
+    )
+  }))
+}
+
+calibration_all <- bind_rows(
+  calibrate_nb(test$lambda_nb,    theta_nb,          "glm.nb"),
+  calibrate_nb(test$lambda_xgb,   theta_xgb_nb,      "XGB + NB"),
+  calibrate_norm(test$lambda_xgb, sigma_xgb_norm,    "XGB + Normal (static)"),
+  calibrate_norm(test$lambda_xgb, test$sigma_xgb_dyn,"XGB + Normal (dynamic)")
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. RPS
+# ─────────────────────────────────────────────────────────────────────────────
+calc_rps_nb <- function(lambdas, theta, actuals, max_k = 60) {
+  mapply(function(lam, act) {
+    k        <- 0:max_k
+    pred_cdf <- pnbinom(k, size = theta, mu = lam)
+    act_cdf  <- as.numeric(k >= act)
+    mean((pred_cdf - act_cdf)^2)
+  }, lambdas, actuals)
+}
+
+calc_rps_norm <- function(lambdas, sigma, actuals, max_k = 60) {
+  mapply(function(lam, act) {
+    k        <- 0:max_k
+    pred_cdf <- pnorm(k + 0.5, mean = lam, sd = sigma)
+    act_cdf  <- as.numeric(k >= act)
+    mean((pred_cdf - act_cdf)^2)
+  }, lambdas, actuals)
+}
+
+rps_nb               <- calc_rps_nb(test$lambda_nb,   theta_nb,     test$disposals)
+rps_xgb_nb           <- calc_rps_nb(test$lambda_xgb,  theta_xgb_nb, test$disposals)
+rps_xgb_norm_static  <- calc_rps_norm(test$lambda_xgb, sigma_xgb_norm,      test$disposals)
+rps_xgb_norm_dyn     <- calc_rps_norm(test$lambda_xgb, test$sigma_xgb_dyn,  test$disposals)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. LOG-LOSS
+# ─────────────────────────────────────────────────────────────────────────────
+calc_log_loss <- function(prob, actual) {
+  eps  <- 1e-6
+  prob <- pmin(pmax(prob, eps), 1 - eps)
+  mean(-(actual * log(prob) + (1 - actual) * log(1 - prob)))
+}
+
+logloss_results <- bind_rows(lapply(lines_eval, function(l) {
+  actual               <- as.numeric(test$disposals >= l)
+  prob_nb              <- pnbinom(l - 1, size = theta_nb,       mu = test$lambda_nb,  lower.tail = FALSE)
+  prob_xgb_nb          <- pnbinom(l - 1, size = theta_xgb_nb,  mu = test$lambda_xgb, lower.tail = FALSE)
+  prob_xgb_norm_static <- pnorm(l - 0.5, mean = test$lambda_xgb, sd = sigma_xgb_norm,      lower.tail = FALSE)
+  prob_xgb_norm_dyn    <- pnorm(l - 0.5, mean = test$lambda_xgb, sd = test$sigma_xgb_dyn,  lower.tail = FALSE)
+
+  tibble(
+    line     = l,
+    model    = c("glm.nb", "XGB + NB", "XGB + Normal (static)", "XGB + Normal (dynamic)"),
+    log_loss = c(
+      calc_log_loss(prob_nb,              actual),
+      calc_log_loss(prob_xgb_nb,          actual),
+      calc_log_loss(prob_xgb_norm_static, actual),
+      calc_log_loss(prob_xgb_norm_dyn,    actual)
+    )
+  )
+}))
+
+logloss_summary <- logloss_results %>%
+  group_by(model) %>%
+  summarise(log_loss = mean(log_loss)) %>%
+  arrange(log_loss)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. SUMMARY TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+summary_table <- tibble(
+  Model = c("glm.nb", "XGB + NB", "XGB + Normal (static)", "XGB + Normal (dynamic)"),
+  MAE   = c(mean(abs(test$residuals_nb)), rep(mean(abs(test$residuals_xgb)), 3)),
+  RMSE  = c(sqrt(mean(test$residuals_nb^2)), rep(sqrt(mean(test$residuals_xgb^2)), 3)),
+  MBE   = c(mean(test$residuals_nb), rep(mean(test$residuals_xgb), 3)),
+  RPS   = c(mean(rps_nb), mean(rps_xgb_nb), mean(rps_xgb_norm_static), mean(rps_xgb_norm_dyn)),
+  LogLoss = logloss_summary$log_loss
+) %>%
+  mutate(across(where(is.numeric), round, 4))
+
+cat("\n=== MODEL COMPARISON ===\n")
+print(summary_table)
+cat("\n=== CALIBRATION ===\n")
+print(calibration_all %>% arrange(line, model))
+cat("\n=== PARAMETERS ===\n")
+cat("Theta (glm.nb):       ", round(theta_nb,              4), "\n")
+cat("Theta (XGB):          ", round(theta_xgb_nb,          4), "\n")
+cat("Sigma (XGB static):   ", round(sigma_xgb_norm,        4), "\n")
+cat("Sigma (XGB dynamic):  ", round(mean(test$sigma_xgb_dyn), 4), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. PLOTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+theme_set(theme_minimal(base_size = 12))
+
+plot_data <- tibble(
+  actual      = test$disposals,
+  pred_nb     = test$lambda_nb,
+  pred_xgb    = test$lambda_xgb,
+  res_nb      = test$residuals_nb,
+  res_xgb     = test$residuals_xgb,
+  sigma_dyn   = test$sigma_xgb_dyn
+)
+
+# ── 7a. Actual vs Predicted ───────────────────────────────────────────────────
+p_avp_nb <- ggplot(plot_data, aes(x = pred_nb, y = actual)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#3B82F6") +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#1D4ED8") +
+  labs(title = "Actual vs Predicted — glm.nb",
+       x = "Predicted Disposals", y = "Actual Disposals")
+
+p_avp_xgb <- ggplot(plot_data, aes(x = pred_xgb, y = actual)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#10B981") +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#065F46") +
+  labs(title = "Actual vs Predicted — XGBoost",
+       x = "Predicted Disposals", y = "Actual Disposals")
+
+print(p_avp_nb + p_avp_xgb)
+
+# ── 7b. Residual Plots ────────────────────────────────────────────────────────
+p_res_nb <- ggplot(plot_data, aes(x = pred_nb, y = res_nb)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#3B82F6") +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#1D4ED8") +
+  labs(title = "Residuals vs Fitted — glm.nb",
+       x = "Fitted Values", y = "Pearson Residuals")
+
+p_res_xgb <- ggplot(plot_data, aes(x = pred_xgb, y = res_xgb)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#10B981") +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#065F46") +
+  labs(title = "Residuals vs Fitted — XGBoost",
+       x = "Fitted Values", y = "Residuals")
+
+print(p_res_nb + p_res_xgb)
+
+# ── 7c. Q-Q Plots ─────────────────────────────────────────────────────────────
+p_qq_nb <- ggplot(plot_data, aes(sample = res_nb)) +
+  stat_qq(alpha = 0.3, colour = "#3B82F6") +
+  stat_qq_line(colour = "red", linetype = "dashed") +
+  labs(title = "Q-Q Plot — glm.nb Residuals",
+       x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+p_qq_xgb <- ggplot(plot_data, aes(sample = res_xgb)) +
+  stat_qq(alpha = 0.3, colour = "#10B981") +
+  stat_qq_line(colour = "red", linetype = "dashed") +
+  labs(title = "Q-Q Plot — XGBoost Residuals",
+       x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+print(p_qq_nb + p_qq_xgb)
+
+# ── 7d. Calibration Plot per Line ─────────────────────────────────────────────
+p_cal <- ggplot(calibration_all, aes(x = avg_pred_prob, y = actual_rate, colour = model)) +
+  geom_point(size = 3) +
+  geom_line(aes(group = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~ line, labeller = label_both) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title    = "Calibration Plot by Line",
+       x        = "Mean Predicted Probability",
+       y        = "Actual Hit Rate",
+       colour   = "Model") +
+  theme(legend.position = "bottom")
+
+print(p_cal)
+
+# ── 7e. Validation Curve (RPS across lines) ───────────────────────────────────
+lines_full <- 10:35
+
+val_curve <- bind_rows(lapply(lines_full, function(l) {
+  bind_rows(
+    tibble(model = "glm.nb",
+           line  = l,
+           rps   = mean(calc_rps_nb(test$lambda_nb,   theta_nb,     test$disposals))),
+    tibble(model = "XGB + NB",
+           line  = l,
+           rps   = mean(calc_rps_nb(test$lambda_xgb,  theta_xgb_nb, test$disposals))),
+    tibble(model = "XGB + Normal (static)",
+           line  = l,
+           rps   = mean(calc_rps_norm(test$lambda_xgb, sigma_xgb_norm,     test$disposals))),
+    tibble(model = "XGB + Normal (dynamic)",
+           line  = l,
+           rps   = mean(calc_rps_norm(test$lambda_xgb, test$sigma_xgb_dyn, test$disposals)))
+  )
+}))
+
+p_val <- ggplot(val_curve, aes(x = line, y = rps, colour = model)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title  = "Validation Curve — RPS by Disposal Line",
+       x      = "Disposal Line",
+       y      = "Mean RPS (lower = better)",
+       colour = "Model") +
+  theme(legend.position = "bottom")
+
+print(p_val)
+
+# ── 7f. SHAP Summary Plot ─────────────────────────────────────────────────────
+shap <- shapviz(model_xgb, X_pred = as.matrix(test[, features_encoded]))
+
+p_shap_bar <- sv_importance(shap, kind = "bar") +
+  labs(title = "SHAP Feature Importance — XGBoost")
+
+p_shap_bee <- sv_importance(shap, kind = "beeswarm") +
+  labs(title = "SHAP Beeswarm — XGBoost")
+
+print(p_shap_bar)
+print(p_shap_bee)
+```
+
+
+
+```{r}
+## Spawning in predictions from new data
+# ── 1. Prepare new data with the same transformations ─────────────────────────
+# Save levels from training data
+pos_levels  <- levels(as.factor(player_stats_disposals_concluded$player.player.position))
+venue_levels <- levels(as.factor(player_stats_disposals_concluded$venue))
+opp_levels  <- levels(as.factor(player_stats_disposals_concluded$opponent))
+
+# Get unseen data
+new_data <- player_stats_disposals %>%
+  filter(status != "CONCLUDED") %>% 
+  dplyr::select(player.playerId,player.givenName, player.surname, 
+         player.player.position, year, round.roundNumber, opponent, venue, disposals,
+         disp_lag, cba_lag, tog_lag, 
+         ewma_TOG_lag, ewma_disp_lag, ewma_cba_lag, 
+         avg_disp_last5, avg_cba_last5, avg_TOG_last5,
+        var_disp_last5, avg_disp_last3,
+        var_disp_last3, opp_disp_factor, opp_cont_poss_factor, opp_uncont_poss_factor,
+        opp_gbg_factor, opp_metres_gained_factor)
+  
+
+# Apply same levels to new data
+new_data <- new_data %>%
+  mutate(
+    position_encoded = as.numeric(factor(player.player.position, levels = pos_levels)),
+    venue_encoded    = as.numeric(factor(venue,     levels = venue_levels)),
+    opp_encoded      = as.numeric(factor(opponent,  levels = opp_levels))
+  )
+
+new_data <- new_data %>%
+  mutate(
+    confidence_flag = case_when(
+      is.na(ewma_disp_lag)  ~ "no_history",
+      is.na(avg_disp_last3) ~ "insufficient_history",
+      is.na(avg_disp_last5) ~ "insufficient_history",
+      TRUE                  ~ "ok"
+    )
+  )
+
+# ── 2. Create DMatrix (no label needed for prediction) ────────────────────────
+new_matrix <- xgb.DMatrix(
+  data = as.matrix(new_data[, features_encoded])
+)
+
+# ── 3. Predict lambda (expected disposal count) ───────────────────────────────
+lambda_new <- predict(model_xgb, new_matrix)
+
+# ── 4. Get over probabilities for a given line ─────────────────────────
+
+# ── Define lines ──────────────────────────────────────────────────────────────
+lines <- 10:30
+
+# ── Generate probabilities for each line ─────────────────────────────────────
+prob_table <- lapply(lines, function(l) {
+  new_data %>%
+    mutate(
+      line           = l,
+      prob_over_norm = pnorm(l - 0.5, mean = lambda_new, sd = sigma_xgb_norm, lower.tail = FALSE),
+      decimal_odds   = 1 / prob_over_norm,
+    ) %>%
+    dplyr::select(player.givenName, player.surname, opponent, line, prob_over_norm, decimal_odds, confidence_flag)  # adjust name col as needed
+}) %>%
+  bind_rows()
+
+# ── View results ──────────────────────────────────────────────────────────────
+
+prob_table_wide <- prob_table %>%
+  dplyr::select(player.givenName, player.surname, opponent, line, decimal_odds, confidence_flag) %>%
+  pivot_wider(
+    names_from  = line,
+    values_from = decimal_odds,
+    names_prefix = "line_"
+  )
+
+clean_odds <- extract_afl_props(all_markets) %>%
+  mutate(fair_odds = 1/((1/odds)/1.08))
+
+clean_odds_wide <- clean_odds %>%
+  mutate(
+    line      = as.numeric(str_extract(market, "\\d+")),
+    full_name = selection_name
+  ) %>%
+  filter(
+    stat == "disposals",
+    str_detect(market, "^\\d+\\+\\s*[Dd]isposals$")
+  ) %>%
+  mutate(
+    player.givenName = str_extract(full_name, "^\\S+"),
+    player.surname   = str_remove(full_name, "^\\S+\\s+")
+  ) %>%
+  dplyr::select(player.givenName, player.surname, line, odds, fair_odds) %>%
+  pivot_wider(
+    names_from   = line,
+    values_from  = c(odds, fair_odds),
+    names_glue   = "{.value}_{line}"
+  ) %>%
+  rename_with(~ str_replace(., "^odds_", "sportsbet_odds_"),    starts_with("odds_")) %>%
+  rename_with(~ str_replace(., "^fair_odds_", "sportsbet_fair_odds_"), starts_with("fair_odds_"))
+
+```
+
+```{r}
+# ── Join and filter insufficient history ─────────────────────────────────────
+comparison <- prob_table_wide %>%
+  left_join(clean_odds_wide, by = c("player.givenName", "player.surname")) %>%
+  filter(confidence_flag == "ok")
+
+# ── Derive common lines ───────────────────────────────────────────────────────
+model_lines     <- as.numeric(str_extract(colnames(comparison)[str_detect(colnames(comparison), "^line_\\d+")], "\\d+"))
+sportsbet_lines <- as.numeric(str_extract(colnames(comparison)[str_detect(colnames(comparison), "^sportsbet_odds_\\d+")], "\\d+"))
+common_lines    <- intersect(model_lines, sportsbet_lines)
+
+# ── Calculate EV ─────────────────────────────────────────────────────────────
+for (l in common_lines) {
+  model_col     <- paste0("line_", l)
+  sportsbet_col <- paste0("sportsbet_odds_", l)
+  ev_col        <- paste0("ev_", l)
+
+  comparison <- comparison %>%
+    mutate(
+      !!ev_col := (1 / .data[[model_col]]) * (.data[[sportsbet_col]] - 1) -
+                 (1 - (1 / .data[[model_col]])) * 1
+    )
+}
+
+# ── Pivot model odds long ─────────────────────────────────────────────────────
+model_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, opponent, starts_with("line_")) %>%
+  pivot_longer(
+    cols         = starts_with("line_"),
+    names_to     = "line",
+    values_to    = "model_odds",
+    names_prefix = "line_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot sportsbet odds long ─────────────────────────────────────────────────
+sportsbet_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("sportsbet_odds_")) %>%
+  pivot_longer(
+    cols         = starts_with("sportsbet_odds_"),
+    names_to     = "line",
+    values_to    = "sportsbet_odds",
+    names_prefix = "sportsbet_odds_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot EV long ─────────────────────────────────────────────────────────────
+ev_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("ev_")) %>%
+  pivot_longer(
+    cols         = starts_with("ev_"),
+    names_to     = "line",
+    values_to    = "ev",
+    names_prefix = "ev_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Join all three and filter positive EV ────────────────────────────────────
+comparison_long <- model_long %>%
+  left_join(sportsbet_long, by = c("player.givenName", "player.surname", "line")) %>%
+  left_join(ev_long,        by = c("player.givenName", "player.surname", "line")) %>%
+  filter(!is.na(ev), !is.na(sportsbet_odds), ev > 0) %>%
+  dplyr::select(player.givenName, player.surname, opponent, line,
+                model_odds, sportsbet_odds, ev) %>%
+  arrange(desc(ev))
+
+print(comparison_long, n = Inf)
+```

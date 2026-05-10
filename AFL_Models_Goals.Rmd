@@ -1,0 +1,1120 @@
+---
+title: "AFL Betting"
+output: html_document
+date: "2026-03-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(fitzRoy)
+library(dplyr)
+library(purrr)
+library(lubridate)
+library(slider)
+library(tidyr)
+```
+
+## R Markdown
+
+```{r EWMA}
+library(purrr)
+
+calc_ewma <- function(x, alpha = 0.7) {
+  if (length(x) == 0) return(numeric(0))
+  accumulate(x, ~ alpha * .y + (1 - alpha) * .x)
+}
+
+```
+
+
+```{r AFL Data}
+##Extract Data spanning the past decade
+current_year <- as.numeric(format(Sys.Date(), "%Y"))
+seasons <- 2016:current_year
+data_player <- map_dfr(seasons, ~ fetch_player_stats(season = .x))
+
+##Get AFL fixture to help determine opponent team 
+fixtures <- fetch_fixture(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS" | status == "SCHEDULED") %>%
+  dplyr::select(providerId, home.team.name, away.team.name)
+
+
+##Extract AFL Lineup data of games that haven't happened
+afl_lineups <- fetch_lineup_afl(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS") %>%
+  left_join(fixtures, by="providerId") %>%
+  mutate(year = year(utcStartTime),
+         opponent = case_when(
+           teamType == 'home' & teamName == home.team.name ~ away.team.name,
+           teamType == 'away' & teamName == away.team.name ~ home.team.name
+         ),
+         venue = venue.name) %>%
+  dplyr::select(providerId,
+                status,
+                player.playerId,
+                player.playerName.givenName, 
+                player.playerName.surname,
+                position,
+                year,
+                round.roundNumber,
+                teamName,
+                opponent,
+                venue
+                )
+
+
+## Create dataframe that will be binded onto player stats goals
+# Align afl_lineups columns to match player_stats_goals schema
+future_games <- afl_lineups %>%
+  mutate(
+    player.givenName                        = player.playerName.givenName,
+    player.surname                          = player.playerName.surname,
+    player.player.position                  = position,
+    team.name                               = teamName,
+    goals                               = NA_real_,
+    behinds = NA_real_,
+    total_points = NA_real_,
+    inside50s  = NA_real_,
+    marksInside50             = NA_real_,
+    timeOnGroundPercentage                  = NA_real_,
+    goalAccuracy    = NA_real_,
+    shotsAtGoal    = NA_real_,
+    extendedStats.marksOnLead = NA_real_,
+    extendedStats.f50GroundBallGets              = NA_real_,
+    intercepts    = NA_real_,
+    extendedStats.defHalfPressureActs       = NA_real_,
+    extendedStats.spoils  = NA_real_,
+    extendedStats.contestDefOneOnOnes = NA_real_,
+    extendedStats.contestDefLosses = NA_real_,
+    extendedStats.interceptMarks = NA_real_,
+    contestedPossessions = NA_real_,
+    uncontestedPossessions = NA_real_,
+    extendedStats.groundBallGets = NA_real_,
+    
+  ) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    goals,
+    behinds,
+    inside50s,
+    marksInside50,
+    timeOnGroundPercentage,
+    goalAccuracy,
+    shotsAtGoal,
+    extendedStats.marksOnLead,
+    extendedStats.f50GroundBallGets,
+    intercepts,
+    extendedStats.defHalfPressureActs,
+    extendedStats.spoils,
+    extendedStats.contestDefOneOnOnes,
+    extendedStats.contestDefLosses,
+    extendedStats.interceptMarks,
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets
+  )
+
+
+
+##Get the goal stats
+player_stats_goals_concluded <- data_player  %>%
+  filter(status == "CONCLUDED" | status == "CONFIRMED_TEAMS" ) %>%
+  mutate(year = year(utcStartTime),
+         total_points = (goals*6 + behinds),
+         opponent = case_when(
+           teamStatus == 'home' & team.name == home.team.name ~ away.team.name,
+           teamStatus == 'away' & team.name == away.team.name ~ home.team.name
+         ),
+    venue = venue.name) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.playerId,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    goals,
+    behinds,
+    total_points,
+    inside50s,
+    marksInside50,
+    timeOnGroundPercentage,
+    goalAccuracy,
+    shotsAtGoal,
+    extendedStats.marksOnLead,
+    extendedStats.f50GroundBallGets,
+    intercepts,
+    extendedStats.defHalfPressureActs,
+    extendedStats.spoils,
+    extendedStats.contestDefOneOnOnes,
+    extendedStats.contestDefLosses,
+    extendedStats.interceptMarks,
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets
+    
+  )
+
+# Bind into the main dataframe
+player_stats_goals <- bind_rows(player_stats_goals_concluded, future_games)
+
+```
+
+```{r feature_engineering}
+##conduct feature engineering on the data that will be trained on
+
+##Use lag function to get prior game goals
+player_stats_goals <- player_stats_goals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    goal_lag = lag(goals),
+    inside50s_lag = lag(inside50s),
+    tog_lag = lag(timeOnGroundPercentage),
+    goalAccuracy_lag = lag(goalAccuracy),
+    shotsAtGoal_lag = lag(shotsAtGoal),
+    marksOnLead_lag = lag(extendedStats.marksOnLead),
+    f50GroundBallGets_lag = lag(extendedStats.f50GroundBallGets),
+    marksInside50_lag = lag(marksInside50),
+    total_points_lag = lag(total_points),
+    intercepts_lag = lag(intercepts),
+    defHalfPressureActs_lag = lag(extendedStats.defHalfPressureActs),
+    spoils_lag = lag(extendedStats.spoils),
+    contestDefOneOnOnes_lag = lag(extendedStats.contestDefOneOnOnes),
+    contestDefLosses_lag  =  lag(extendedStats.contestDefLosses),
+    interceptMarks_lag = lag(extendedStats.interceptMarks)  
+    
+    
+  )
+
+##Calculate averages and use lag to shift prior
+player_stats_goals <- player_stats_goals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    ewma_goal_lag    = replace(goal_lag, !is.na(goal_lag), calc_ewma(goal_lag[!is.na(goal_lag)])),
+    ewma_inside50s_lag    = replace(inside50s_lag, !is.na(inside50s_lag), calc_ewma(inside50s_lag[!is.na(inside50s_lag)])),
+    ewma_GA_lag     = replace(goalAccuracy_lag, !is.na(goalAccuracy_lag), calc_ewma(goalAccuracy_lag[!is.na(goalAccuracy_lag)])),
+    ewma_SAG_lag     = replace(shotsAtGoal_lag, !is.na(shotsAtGoal_lag), calc_ewma(shotsAtGoal_lag[!is.na(shotsAtGoal_lag)])),
+    ewma_TOG_lag     = replace(tog_lag, !is.na(tog_lag), calc_ewma(tog_lag[!is.na(tog_lag)])),
+    ewma_MOL_lag     = replace(marksOnLead_lag, !is.na(marksOnLead_lag), calc_ewma(marksOnLead_lag[!is.na(marksOnLead_lag)])),
+    ewma_f50GBG_lag   = replace(f50GroundBallGets_lag, !is.na(f50GroundBallGets_lag), calc_ewma(f50GroundBallGets_lag[!is.na(f50GroundBallGets_lag)])),
+    ewma_marksInside50_lag = replace(marksInside50_lag, !is.na(marksInside50_lag), calc_ewma(marksInside50_lag[!is.na(marksInside50_lag)])),
+    avg_goal_last5   = lag(slide_dbl(goal_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    var_goal_last5   = lag(slide_dbl(goal_lag, ~ var(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_inside50s_last5   = lag(slide_dbl(inside50s_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_SAG_last5   = lag(slide_dbl(shotsAtGoal_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_TOG_last5   = lag(slide_dbl(tog_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_MOL_last5   = lag(slide_dbl(marksOnLead_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_f50GBG_last5   = lag(slide_dbl(f50GroundBallGets_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_marksInside50_5 = lag(slide_dbl(marksInside50_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_goal_last3   = lag(slide_dbl(goal_lag, ~ mean(.x, na.rm = TRUE), .before = 2, .complete = FALSE)),
+    var_goal_last3   = lag(slide_dbl(goal_lag, ~ var(.x, na.rm = TRUE), .before = 2, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+
+# ── Opponent defensive profile — goals/attacks CONCEDED (grouped by opponent) ─
+# i.e. what does each team give up to the opposition forwards
+opponent_defensive_profile_conc <- player_stats_goals %>%
+  filter(status == "CONCLUDED") %>%
+  group_by(year, round.roundNumber, opponent) %>%
+  summarise(
+    goals_conceded       = sum(goal_lag,              na.rm = TRUE),
+    inside50s_conceded   = sum(inside50s_lag,         na.rm = TRUE),
+    shotsAtGoal_conceded = sum(shotsAtGoal_lag,       na.rm = TRUE),
+    marksOnLead_conceded = sum(marksOnLead_lag,       na.rm = TRUE),
+    marksInside50_conceded = sum(marksInside50_lag,       na.rm = TRUE),
+    f50GBG_conceded      = sum(f50GroundBallGets_lag, na.rm = TRUE),
+    total_points_conceded = sum(total_points_lag,     na.rm = TRUE),
+    # ── Total points per inside 50 — efficiency of attacks against this team ──
+    points_per_i50_conceded = total_points_conceded / inside50s_conceded,
+    .groups = "drop"
+  )
+
+# ── Defensive actions PRODUCED — grouped by team name not opponent ────────────
+# i.e. what defensive work does each team produce themselves
+opponent_defensive_profile_for <- player_stats_goals %>%
+  filter(status == "CONCLUDED") %>%
+  group_by(year, round.roundNumber, team.name) %>%
+  summarise(
+    intercepts_for          = sum(intercepts_lag,          na.rm = TRUE),
+    defHalfPressureActs_for = sum(defHalfPressureActs_lag, na.rm = TRUE),
+    spoils_for              = sum(spoils_lag,              na.rm = TRUE),
+    contestDefOneOnOnes_for = sum(contestDefOneOnOnes_lag, na.rm = TRUE),
+    contestDefLosses_for    = sum(contestDefLosses_lag,    na.rm = TRUE),
+    interceptMarks_for      = sum(interceptMarks_lag,      na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Rename team.name to opponent so it can be joined to conceded profile
+  rename(opponent = team.name)
+
+# ── Join conceded and produced into single profile ────────────────────────────
+opponent_defensive_profile <- opponent_defensive_profile_conc %>%
+  left_join(opponent_defensive_profile_for,
+            by = c("year", "round.roundNumber", "opponent"))
+
+# ── Rolling 5 game averages ───────────────────────────────────────────────────
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  arrange(opponent, year, round.roundNumber) %>%
+  group_by(opponent) %>%
+  mutate(
+    avg_goals_conceded          = lag(slide_dbl(goals_conceded,          ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_inside50s_conceded      = lag(slide_dbl(inside50s_conceded,      ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_shotsAtGoal_conceded    = lag(slide_dbl(shotsAtGoal_conceded,    ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_marksOnLead_conceded    = lag(slide_dbl(marksOnLead_conceded,    ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_f50GBG_conceded         = lag(slide_dbl(f50GBG_conceded,         ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_marksInside50_conceded        = lag(slide_dbl(marksInside50_conceded,         ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_points_per_i50_conceded = lag(slide_dbl(points_per_i50_conceded, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_intercepts_for          = lag(slide_dbl(intercepts_for,          ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_defHalfPressureActs_for = lag(slide_dbl(defHalfPressureActs_for, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_spoils_for              = lag(slide_dbl(spoils_for,              ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_contestDefOneOnOnes_for = lag(slide_dbl(contestDefOneOnOnes_for, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_contestDefLosses_for    = lag(slide_dbl(contestDefLosses_for,    ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_interceptMarks_for      = lag(slide_dbl(interceptMarks_for,      ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+# ── League averages ───────────────────────────────────────────────────────────
+league_avgs <- opponent_defensive_profile %>%
+  filter(!is.na(avg_goals_conceded)) %>%
+  summarise(
+    league_goals_conceded          = mean(goals_conceded,          na.rm = TRUE),
+    league_inside50s_conceded      = mean(inside50s_conceded,      na.rm = TRUE),
+    league_shotsAtGoal_conceded    = mean(shotsAtGoal_conceded,    na.rm = TRUE),
+    league_marksOnLead_conceded    = mean(marksOnLead_conceded,    na.rm = TRUE),
+    league_f50GBG_conceded         = mean(f50GBG_conceded,         na.rm = TRUE),
+    league_marksInside50_conceded  = mean(marksInside50_conceded,  na.rm = TRUE),
+    league_points_per_i50_conceded = mean(points_per_i50_conceded, na.rm = TRUE),
+    league_intercepts_for          = mean(intercepts_for,          na.rm = TRUE),
+    league_defHalfPressureActs_for = mean(defHalfPressureActs_for, na.rm = TRUE),
+    league_spoils_for              = mean(spoils_for,              na.rm = TRUE),
+    league_contestDefOneOnOnes_for = mean(contestDefOneOnOnes_for, na.rm = TRUE),
+    league_contestDefLosses_for    = mean(contestDefLosses_for,    na.rm = TRUE),
+    league_interceptMarks_for      = mean(interceptMarks_for,      na.rm = TRUE)
+  )
+
+# ── Opponent factors ──────────────────────────────────────────────────────────
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  mutate(
+    opp_goals_factor               = avg_goals_conceded          / league_avgs$league_goals_conceded,
+    opp_inside50s_factor           = avg_inside50s_conceded      / league_avgs$league_inside50s_conceded,
+    opp_shotsAtGoal_factor         = avg_shotsAtGoal_conceded    / league_avgs$league_shotsAtGoal_conceded,
+    opp_marksOnLead_factor         = avg_marksOnLead_conceded    / league_avgs$league_marksOnLead_conceded,
+    opp_f50GBG_factor              = avg_f50GBG_conceded         / league_avgs$league_f50GBG_conceded,
+    opp_marksInside50_factor       = avg_marksInside50_conceded  / league_avgs$league_marksInside50_conceded,
+    opp_points_per_i50_factor      = avg_points_per_i50_conceded / league_avgs$league_points_per_i50_conceded,
+    opp_intercepts_factor          = avg_intercepts_for          / league_avgs$league_intercepts_for,
+    opp_defHalfPressureActs_factor = avg_defHalfPressureActs_for / league_avgs$league_defHalfPressureActs_for,
+    opp_spoils_factor              = avg_spoils_for              / league_avgs$league_spoils_for,
+    opp_contestDefOneOnOnes_factor = avg_contestDefOneOnOnes_for / league_avgs$league_contestDefOneOnOnes_for,
+    opp_contestDefLosses_factor    = avg_contestDefLosses_for    / league_avgs$league_contestDefLosses_for,
+    opp_interceptMarks_factor      = avg_interceptMarks_for      / league_avgs$league_interceptMarks_for
+  ) %>%
+  dplyr::select(
+    year, round.roundNumber, opponent,
+    opp_goals_factor,
+    opp_inside50s_factor,
+    opp_shotsAtGoal_factor,
+    opp_marksOnLead_factor,
+    opp_f50GBG_factor,
+    opp_marksInside50_factor,
+    opp_points_per_i50_factor,
+    opp_intercepts_factor,
+    opp_defHalfPressureActs_factor,
+    opp_spoils_factor,
+    opp_contestDefOneOnOnes_factor,
+    opp_contestDefLosses_factor,
+    opp_interceptMarks_factor
+  )
+
+# ── Join back to player stats ─────────────────────────────────────────────────
+player_stats_goals <- player_stats_goals %>%
+  left_join(opponent_defensive_profile,
+            by = c("year", "round.roundNumber", "opponent"))
+
+```
+
+
+```{r}
+##Final Data Output
+
+
+player_stats_goals_concluded <- player_stats_goals %>%
+  filter(status == "CONCLUDED") %>% 
+  dplyr::select(player.playerId,player.givenName, player.surname, 
+         player.player.position, year, round.roundNumber, opponent, venue, goals,
+         goal_lag, goalAccuracy_lag, tog_lag, inside50s_lag, f50GroundBallGets_lag,  marksInside50_lag, marksOnLead_lag,
+         ewma_goal_lag,
+    ewma_inside50s_lag,
+    ewma_GA_lag,
+    ewma_SAG_lag,
+    ewma_TOG_lag,
+    ewma_MOL_lag,
+    ewma_f50GBG_lag,
+    ewma_marksInside50_lag,
+    avg_goal_last5,
+    var_goal_last5,
+    avg_inside50s_last5,
+    avg_SAG_last5,
+    avg_TOG_last5,
+    avg_MOL_last5,
+    avg_f50GBG_last5,
+    avg_marksInside50_5,
+    avg_goal_last3,
+    var_goal_last3,
+    opp_goals_factor,
+    opp_inside50s_factor,
+    opp_shotsAtGoal_factor,
+    opp_marksOnLead_factor,
+    opp_f50GBG_factor,
+    opp_marksInside50_factor,
+    opp_points_per_i50_factor,
+    opp_intercepts_factor,
+    opp_defHalfPressureActs_factor,
+    opp_spoils_factor,
+    opp_contestDefOneOnOnes_factor,
+    opp_contestDefLosses_factor,
+    opp_interceptMarks_factor) %>%
+  drop_na()
+
+```
+
+
+
+
+```{r}
+##Model Development
+
+library(MASS)
+
+# ── Sort by time ──────────────────────────────────────────────────────────────
+player_stats_goals_concluded <- player_stats_goals_concluded %>%
+  arrange(year, round.roundNumber)
+
+# ── Train/test split ──────────────────────────────────────────────────────────
+train <- player_stats_goals_concluded %>% slice_head(prop = 0.9)
+test  <- player_stats_goals_concluded %>% slice_tail(prop = 0.1)
+
+# ── Save known levels from train ──────────────────────────────────────────────
+known_opponents <- levels(as.factor(train$opponent))
+known_venues    <- levels(as.factor(train$venue))
+known_positions <- levels(as.factor(train$player.player.position))
+
+# ── Apply to train ────────────────────────────────────────────────────────────
+train <- train %>%
+  mutate(
+    venue    = ifelse(venue %in% c("Adelaide Arena at Jiangwan Stadium"), "Unknown", venue),
+    opponent               = factor(opponent,               levels = c(known_opponents, "Unknown")),
+    venue                  = factor(venue,                  levels = c(known_venues,    "Unknown")),
+    player.player.position = factor(player.player.position, levels = c(known_positions, "Unknown"))
+  )
+
+# ── Add dummy row so glm.nb registers Unknown in xlevels ─────────────────────
+dummy_row <- train[1, ] %>%
+  mutate(
+    opponent               = factor("Unknown", levels = c(known_opponents, "Unknown")),
+    venue                  = factor("Unknown", levels = c(known_venues,    "Unknown")),
+    player.player.position = factor("Unknown", levels = c(known_positions, "Unknown"))
+  )
+
+train_with_dummy <- bind_rows(train, dummy_row)
+
+# ── Fit model ─────────────────────────────────────────────────────────────────
+model_goals_nb <- glm.nb(
+  goals ~ player.player.position + opponent + venue +
+    goal_lag + goalAccuracy_lag + tog_lag + inside50s_lag +
+    f50GroundBallGets_lag + marksInside50_lag + marksOnLead_lag +
+    ewma_goal_lag + ewma_inside50s_lag + ewma_GA_lag +
+    ewma_SAG_lag + ewma_TOG_lag + ewma_MOL_lag +
+    ewma_f50GBG_lag + ewma_marksInside50_lag +
+    avg_goal_last5 + var_goal_last5 + avg_inside50s_last5 +
+    avg_SAG_last5 + avg_TOG_last5 + avg_MOL_last5 +
+    avg_f50GBG_last5 + avg_marksInside50_5 +
+    avg_goal_last3 + var_goal_last3 +
+    opp_goals_factor + opp_inside50s_factor + opp_shotsAtGoal_factor +
+    opp_marksOnLead_factor + opp_f50GBG_factor + opp_marksInside50_factor +
+    opp_points_per_i50_factor + opp_intercepts_factor +
+    opp_defHalfPressureActs_factor + opp_spoils_factor +
+    opp_contestDefOneOnOnes_factor + opp_contestDefLosses_factor +
+    opp_interceptMarks_factor,
+  data = train_with_dummy
+)
+
+# ── Coerce unseen levels in test to Unknown ───────────────────────────────────
+test <- test %>%
+  mutate(
+    opponent = ifelse(opponent %in% known_opponents, opponent, "Unknown"),
+    venue    = ifelse(venue    %in% known_venues,    venue,    "Unknown"),
+    player.player.position = ifelse(
+      player.player.position %in% known_positions,
+      player.player.position, "Unknown"
+    ),
+    opponent               = factor(opponent,               levels = c(known_opponents, "Unknown")),
+    venue                  = factor(venue,                  levels = c(known_venues,    "Unknown")),
+    player.player.position = factor(player.player.position, levels = c(known_positions, "Unknown"))
+  )
+
+# ── Predict on test ───────────────────────────────────────────────────────────
+lambda_test <- predict(model_goals_nb, newdata = test, type = "response")
+
+
+
+library(xgboost)
+library(dplyr)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
+player_stats_goals_concluded <- player_stats_goals_concluded %>%
+  mutate(
+    position_encoded = as.numeric(as.factor(player.player.position)),
+    venue_encoded    = as.numeric(as.factor(venue)),
+    opp_encoded      = as.numeric(as.factor(opponent))
+  )
+
+features_encoded <- c(
+  "goal_lag", "goalAccuracy_lag", "tog_lag", "inside50s_lag",
+  "f50GroundBallGets_lag", "marksInside50_lag", "marksOnLead_lag",
+  "ewma_goal_lag", "ewma_inside50s_lag", "ewma_GA_lag",
+  "ewma_SAG_lag", "ewma_TOG_lag", "ewma_MOL_lag", "ewma_f50GBG_lag",
+  "ewma_marksInside50_lag",
+  "avg_goal_last5", "var_goal_last5", "avg_inside50s_last5",
+  "avg_SAG_last5", "avg_TOG_last5", "avg_MOL_last5",
+  "avg_f50GBG_last5", "avg_marksInside50_5",
+  "avg_goal_last3", "var_goal_last3",
+  "opp_goals_factor", "opp_inside50s_factor", "opp_shotsAtGoal_factor",
+  "opp_marksOnLead_factor", "opp_f50GBG_factor", "opp_marksInside50_factor",
+  "opp_points_per_i50_factor", "opp_intercepts_factor",
+  "opp_defHalfPressureActs_factor", "opp_spoils_factor",
+  "opp_contestDefOneOnOnes_factor", "opp_contestDefLosses_factor",
+  "opp_interceptMarks_factor",
+  "position_encoded", "venue_encoded", "opp_encoded"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. TRAIN / TEST SPLIT
+# ─────────────────────────────────────────────────────────────────────────────
+player_stats_goals_concluded <- player_stats_goals_concluded %>%
+  arrange(year, round.roundNumber)
+
+train <- player_stats_goals_concluded %>% slice_head(prop = 0.9)
+test  <- player_stats_goals_concluded %>% slice_tail(prop = 0.1)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. BASE MODEL (MEAN)
+# ─────────────────────────────────────────────────────────────────────────────
+train_matrix <- xgb.DMatrix(
+  data  = as.matrix(train[, features_encoded]),
+  label = train$goals
+)
+
+test_matrix <- xgb.DMatrix(
+  data  = as.matrix(test[, features_encoded]),
+  label = test$goals
+)
+
+params <- list(
+  objective        = "count:poisson",
+  eta              = 0.05,
+  max_depth        = 5,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 10
+)
+
+model_xgb_goals <- xgb.train(
+  params                = params,
+  data                  = train_matrix,
+  nrounds               = 1000,
+  watchlist             = list(train = train_matrix, test = test_matrix),
+  early_stopping_rounds = 30,
+  verbose               = 1
+)
+
+lambda_train <- predict(model_xgb_goals, train_matrix)
+lambda_test  <- predict(model_xgb_goals, test_matrix)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. FIT NB THETA ON TEST RESIDUALS
+# ─────────────────────────────────────────────────────────────────────────────
+library(MASS)
+
+theta_xgb_goals <- tryCatch(
+  fitdistr(
+    test$goals,
+    "negative binomial",
+    start = list(mu = mean(lambda_test), size = 5)
+  )$estimate["size"],
+  error = function(e) {
+    cat("NB theta fit failed, falling back to Poisson\n")
+    NULL
+  }
+)
+
+cat("XGBoost Goals Theta (NB): ", round(theta_xgb_goals, 4), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. CALIBRATION — Poisson and NB
+# ─────────────────────────────────────────────────────────────────────────────
+# Use goal-appropriate lines
+lines_eval <- c(1, 2, 3, 4)
+
+calibration_pois <- lapply(lines_eval, function(l) {
+  tibble(
+    model         = "XGBoost + Poisson",
+    line          = l,
+    avg_pred_prob = mean(ppois(l - 1, lambda = lambda_test,
+                               lower.tail = FALSE), na.rm = TRUE),
+    actual_rate   = mean(test$goals >= l, na.rm = TRUE),
+    n             = nrow(test)
+  )
+}) %>% bind_rows()
+
+calibration_nb <- lapply(lines_eval, function(l) {
+  tibble(
+    model         = "XGBoost + NB",
+    line          = l,
+    avg_pred_prob = mean(pnbinom(l - 1, size = theta_xgb_goals,
+                                 mu = lambda_test, lower.tail = FALSE), na.rm = TRUE),
+    actual_rate   = mean(test$goals >= l, na.rm = TRUE),
+    n             = nrow(test)
+  )
+}) %>% bind_rows()
+
+calibration_all <- bind_rows(calibration_pois, calibration_nb) %>%
+  arrange(line, model)
+
+cat("\n=== Calibration Comparison ===\n")
+print(calibration_all)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. CALIBRATION AWARE THETA TUNING (NB)
+# ─────────────────────────────────────────────────────────────────────────────
+# Find theta that minimises calibration error at goal lines
+
+best_theta    <- theta_xgb_goals
+best_cal_error <- Inf
+
+for (theta_candidate in seq(1, 20, by = 0.5)) {
+  cal_error <- mean(sapply(lines_eval, function(l) {
+    pred_prob   <- mean(pnbinom(l - 1, size = theta_candidate,
+                                mu = lambda_test, lower.tail = FALSE))
+    actual_rate <- mean(test$goals >= l)
+    (pred_prob - actual_rate)^2
+  }))
+
+  if (cal_error < best_cal_error) {
+    best_cal_error <- cal_error
+    best_theta     <- theta_candidate
+  }
+}
+
+cat("Best Theta: ", best_theta, "\n")
+cat("Best calibration error: ", round(best_cal_error, 6), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. FINAL OUTPUTS
+# ─────────────────────────────────────────────────────────────────────────────
+test <- test %>%
+  mutate(
+    lambda_xgb    = lambda_test,
+    theta_goals   = best_theta,
+    residuals_xgb = goals - lambda_xgb
+  )
+
+cat("Lambda (mean): ", round(mean(lambda_test), 4), "\n")
+cat("Theta (tuned): ", round(best_theta,        4), "\n")
+```
+
+```{r}
+library(ggplot2)
+library(shapviz)
+library(patchwork)
+library(MASS)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. PREP
+# ─────────────────────────────────────────────────────────────────────────────
+theta_nb       <- model_goals_nb$theta
+lambda_nb      <- predict(model_goals_nb, newdata = test, type = "response")
+lambda_xgb     <- lambda_test
+
+# Fit NB theta for XGBoost
+theta_xgb_nb <- fitdistr(
+  test$goals,
+  "negative binomial",
+  start = list(mu = mean(lambda_xgb), size = 5)
+)$estimate["size"]
+
+test <- test %>%
+  mutate(
+    lambda_nb     = lambda_nb,
+    lambda_xgb    = lambda_xgb,
+    residuals_nb  = goals - lambda_nb,
+    residuals_xgb = goals - lambda_xgb
+  )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. POINT METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+eval_point <- function(res) {
+  c(MAE  = mean(abs(res), na.rm = TRUE),
+    RMSE = sqrt(mean(res^2, na.rm = TRUE)),
+    MBE  = mean(res, na.rm = TRUE))
+}
+
+point_metrics <- bind_rows(
+  as.data.frame(t(eval_point(test$residuals_nb)))  %>% mutate(model = "glm.nb"),
+  as.data.frame(t(eval_point(test$residuals_xgb))) %>% mutate(model = "XGB")
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. CALIBRATION — goal appropriate lines, Poisson and NB only
+# ─────────────────────────────────────────────────────────────────────────────
+lines_eval <- c(1, 2, 3, 4)
+
+calibrate_nb <- function(lambdas, theta, label) {
+  bind_rows(lapply(lines_eval, function(l) {
+    tibble(
+      model         = label,
+      line          = l,
+      avg_pred_prob = mean(pnbinom(l - 1, size = theta,
+                                   mu = lambdas, lower.tail = FALSE)),
+      actual_rate   = mean(test$goals >= l),
+      n             = nrow(test)
+    )
+  }))
+}
+
+calibrate_pois <- function(lambdas, label) {
+  bind_rows(lapply(lines_eval, function(l) {
+    tibble(
+      model         = label,
+      line          = l,
+      avg_pred_prob = mean(ppois(l - 1, lambda = lambdas,
+                                 lower.tail = FALSE)),
+      actual_rate   = mean(test$goals >= l),
+      n             = nrow(test)
+    )
+  }))
+}
+
+calibration_all <- bind_rows(
+  calibrate_nb(test$lambda_nb,  theta_nb,      "glm.nb + NB"),
+  calibrate_nb(test$lambda_xgb, theta_xgb_nb,  "XGB + NB"),
+  calibrate_pois(test$lambda_nb,               "glm.nb + Poisson"),
+  calibrate_pois(test$lambda_xgb,              "XGB + Poisson")
+) %>%
+  arrange(line, model)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. RPS — Poisson and NB only
+# ─────────────────────────────────────────────────────────────────────────────
+calc_rps_nb <- function(lambdas, theta, actuals, max_k = 20) {
+  mapply(function(lam, act) {
+    k        <- 0:max_k
+    pred_cdf <- pnbinom(k, size = theta, mu = lam)
+    act_cdf  <- as.numeric(k >= act)
+    mean((pred_cdf - act_cdf)^2)
+  }, lambdas, actuals)
+}
+
+calc_rps_pois <- function(lambdas, actuals, max_k = 20) {
+  mapply(function(lam, act) {
+    k        <- 0:max_k
+    pred_cdf <- ppois(k, lambda = lam)
+    act_cdf  <- as.numeric(k >= act)
+    mean((pred_cdf - act_cdf)^2)
+  }, lambdas, actuals)
+}
+
+rps_nb_glm    <- calc_rps_nb(test$lambda_nb,   theta_nb,     test$goals)
+rps_nb_xgb    <- calc_rps_nb(test$lambda_xgb,  theta_xgb_nb, test$goals)
+rps_pois_glm  <- calc_rps_pois(test$lambda_nb,               test$goals)
+rps_pois_xgb  <- calc_rps_pois(test$lambda_xgb,              test$goals)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. LOG-LOSS
+# ─────────────────────────────────────────────────────────────────────────────
+calc_log_loss <- function(prob, actual) {
+  eps  <- 1e-6
+  prob <- pmin(pmax(prob, eps), 1 - eps)
+  mean(-(actual * log(prob) + (1 - actual) * log(1 - prob)))
+}
+
+logloss_results <- bind_rows(lapply(lines_eval, function(l) {
+  actual          <- as.numeric(test$goals >= l)
+  prob_nb_glm     <- pnbinom(l - 1, size = theta_nb,      mu = test$lambda_nb,  lower.tail = FALSE)
+  prob_nb_xgb     <- pnbinom(l - 1, size = theta_xgb_nb,  mu = test$lambda_xgb, lower.tail = FALSE)
+  prob_pois_glm   <- ppois(l - 1,   lambda = test$lambda_nb,  lower.tail = FALSE)
+  prob_pois_xgb   <- ppois(l - 1,   lambda = test$lambda_xgb, lower.tail = FALSE)
+
+  tibble(
+    line     = l,
+    model    = c("glm.nb + NB", "XGB + NB", "glm.nb + Poisson", "XGB + Poisson"),
+    log_loss = c(
+      calc_log_loss(prob_nb_glm,   actual),
+      calc_log_loss(prob_nb_xgb,   actual),
+      calc_log_loss(prob_pois_glm, actual),
+      calc_log_loss(prob_pois_xgb, actual)
+    )
+  )
+}))
+
+logloss_summary <- logloss_results %>%
+  group_by(model) %>%
+  summarise(log_loss = mean(log_loss)) %>%
+  arrange(log_loss)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. SUMMARY TABLE
+# ─────────────────────────────────────────────────────────────────────────────
+summary_table <- tibble(
+  Model = c("glm.nb + NB", "XGB + NB", "glm.nb + Poisson", "XGB + Poisson"),
+  MAE   = c(mean(abs(test$residuals_nb)), mean(abs(test$residuals_xgb)),
+            mean(abs(test$residuals_nb)), mean(abs(test$residuals_xgb))),
+  RMSE  = c(sqrt(mean(test$residuals_nb^2)), sqrt(mean(test$residuals_xgb^2)),
+            sqrt(mean(test$residuals_nb^2)), sqrt(mean(test$residuals_xgb^2))),
+  MBE   = c(mean(test$residuals_nb), mean(test$residuals_xgb),
+            mean(test$residuals_nb), mean(test$residuals_xgb)),
+  RPS   = c(mean(rps_nb_glm), mean(rps_nb_xgb),
+            mean(rps_pois_glm), mean(rps_pois_xgb)),
+  LogLoss = logloss_summary$log_loss
+) %>%
+  mutate(across(where(is.numeric), round, 4))
+
+cat("\n=== MODEL COMPARISON ===\n")
+print(summary_table)
+cat("\n=== CALIBRATION ===\n")
+print(calibration_all)
+cat("\n=== PARAMETERS ===\n")
+cat("Theta (glm.nb):  ", round(theta_nb,       4), "\n")
+cat("Theta (XGB NB):  ", round(theta_xgb_nb,   4), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. PLOTS
+# ─────────────────────────────────────────────────────────────────────────────
+theme_set(theme_minimal(base_size = 12))
+
+plot_data <- tibble(
+  actual    = test$goals,
+  pred_nb   = test$lambda_nb,
+  pred_xgb  = test$lambda_xgb,
+  res_nb    = test$residuals_nb,
+  res_xgb   = test$residuals_xgb
+)
+
+# ── 7a. Actual vs Predicted ───────────────────────────────────────────────────
+p_avp_nb <- ggplot(plot_data, aes(x = pred_nb, y = actual)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#3B82F6") +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#1D4ED8") +
+  labs(title = "Actual vs Predicted — glm.nb",
+       x = "Predicted Goals", y = "Actual Goals")
+
+p_avp_xgb <- ggplot(plot_data, aes(x = pred_xgb, y = actual)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#10B981") +
+  geom_abline(slope = 1, intercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#065F46") +
+  labs(title = "Actual vs Predicted — XGBoost",
+       x = "Predicted Goals", y = "Actual Goals")
+
+print(p_avp_nb + p_avp_xgb)
+
+# ── 7b. Residual Plots ────────────────────────────────────────────────────────
+p_res_nb <- ggplot(plot_data, aes(x = pred_nb, y = res_nb)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#3B82F6") +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#1D4ED8") +
+  labs(title = "Residuals vs Fitted — glm.nb",
+       x = "Fitted Values", y = "Pearson Residuals")
+
+p_res_xgb <- ggplot(plot_data, aes(x = pred_xgb, y = res_xgb)) +
+  geom_point(alpha = 0.3, size = 0.8, colour = "#10B981") +
+  geom_hline(yintercept = 0, colour = "red", linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "#065F46") +
+  labs(title = "Residuals vs Fitted — XGBoost",
+       x = "Fitted Values", y = "Residuals")
+
+print(p_res_nb + p_res_xgb)
+
+# ── 7c. Q-Q Plots ─────────────────────────────────────────────────────────────
+p_qq_nb <- ggplot(plot_data, aes(sample = res_nb)) +
+  stat_qq(alpha = 0.3, colour = "#3B82F6") +
+  stat_qq_line(colour = "red", linetype = "dashed") +
+  labs(title = "Q-Q Plot — glm.nb Residuals",
+       x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+p_qq_xgb <- ggplot(plot_data, aes(sample = res_xgb)) +
+  stat_qq(alpha = 0.3, colour = "#10B981") +
+  stat_qq_line(colour = "red", linetype = "dashed") +
+  labs(title = "Q-Q Plot — XGBoost Residuals",
+       x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+print(p_qq_nb + p_qq_xgb)
+
+# ── 7d. Calibration Plot per Line ─────────────────────────────────────────────
+p_cal <- ggplot(calibration_all, aes(x = avg_pred_prob, y = actual_rate, colour = model)) +
+  geom_point(size = 3) +
+  geom_line(aes(group = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  facet_wrap(~ line, labeller = label_both) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title  = "Calibration Plot by Goal Line",
+       x      = "Mean Predicted Probability",
+       y      = "Actual Hit Rate",
+       colour = "Model") +
+  theme(legend.position = "bottom")
+
+print(p_cal)
+
+# ── 7e. Validation Curve (RPS across goal lines) ──────────────────────────────
+lines_full <- 1:8   # goal-appropriate range
+
+val_curve <- bind_rows(lapply(lines_full, function(l) {
+  bind_rows(
+    tibble(model = "glm.nb + NB",
+           line  = l,
+           rps   = mean(calc_rps_nb(test$lambda_nb,   theta_nb,     test$goals))),
+    tibble(model = "XGB + NB",
+           line  = l,
+           rps   = mean(calc_rps_nb(test$lambda_xgb,  theta_xgb_nb, test$goals))),
+    tibble(model = "glm.nb + Poisson",
+           line  = l,
+           rps   = mean(calc_rps_pois(test$lambda_nb,               test$goals))),
+    tibble(model = "XGB + Poisson",
+           line  = l,
+           rps   = mean(calc_rps_pois(test$lambda_xgb,              test$goals)))
+  )
+}))
+
+p_val <- ggplot(val_curve, aes(x = line, y = rps, colour = model)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title  = "Validation Curve — RPS by Goal Line",
+       x      = "Goal Line",
+       y      = "Mean RPS (lower = better)",
+       colour = "Model") +
+  theme(legend.position = "bottom")
+
+print(p_val)
+
+# ── 7f. SHAP Summary Plot ─────────────────────────────────────────────────────
+shap <- shapviz(model_xgb_goals, X_pred = as.matrix(test[, features_encoded]))
+
+p_shap_bar <- sv_importance(shap, kind = "bar") +
+  labs(title = "SHAP Feature Importance — XGBoost Goals")
+
+p_shap_bee <- sv_importance(shap, kind = "beeswarm") +
+  labs(title = "SHAP Beeswarm — XGBoost Goals")
+
+print(p_shap_bar)
+print(p_shap_bee)
+```
+
+
+```{r}
+# ── 1. Prepare new data ───────────────────────────────────────────────────────
+pos_levels   <- levels(as.factor(player_stats_goals_concluded$player.player.position))
+venue_levels <- levels(as.factor(player_stats_goals_concluded$venue))
+opp_levels   <- levels(as.factor(player_stats_goals_concluded$opponent))
+
+new_data <- player_stats_goals %>%
+  filter(status != "CONCLUDED") %>%
+  dplyr::select(
+    player.playerId, player.givenName, player.surname,
+    player.player.position, year, round.roundNumber, opponent, venue, goals,
+    goal_lag, goalAccuracy_lag, tog_lag, inside50s_lag,
+    f50GroundBallGets_lag, marksInside50_lag, marksOnLead_lag,
+    ewma_goal_lag, ewma_inside50s_lag, ewma_GA_lag,
+    ewma_SAG_lag, ewma_TOG_lag, ewma_MOL_lag, ewma_f50GBG_lag,
+    ewma_marksInside50_lag,
+    avg_goal_last5, var_goal_last5, avg_inside50s_last5,
+    avg_SAG_last5, avg_TOG_last5, avg_MOL_last5,
+    avg_f50GBG_last5, avg_marksInside50_5,
+    avg_goal_last3, var_goal_last3,
+    opp_goals_factor, opp_inside50s_factor, opp_shotsAtGoal_factor,
+    opp_marksOnLead_factor, opp_f50GBG_factor, opp_marksInside50_factor,
+    opp_points_per_i50_factor, opp_intercepts_factor,
+    opp_defHalfPressureActs_factor, opp_spoils_factor,
+    opp_contestDefOneOnOnes_factor, opp_contestDefLosses_factor,
+    opp_interceptMarks_factor
+  )
+
+# ── Apply factor encodings ────────────────────────────────────────────────────
+new_data <- new_data %>%
+  mutate(
+    position_encoded = as.numeric(factor(player.player.position, levels = pos_levels)),
+    venue_encoded    = as.numeric(factor(venue,                  levels = venue_levels)),
+    opp_encoded      = as.numeric(factor(opponent,               levels = opp_levels))
+  )
+
+# ── Confidence flag ───────────────────────────────────────────────────────────
+new_data <- new_data %>%
+  mutate(
+    confidence_flag = case_when(
+      is.na(ewma_goal_lag)   ~ "no_history",
+      is.na(avg_goal_last3)  ~ "insufficient_history",
+      is.na(avg_goal_last5)  ~ "insufficient_history",
+      TRUE                   ~ "ok"
+    )
+  )
+
+# ── 2. Create DMatrix ─────────────────────────────────────────────────────────
+new_matrix <- xgb.DMatrix(
+  data = as.matrix(new_data[, features_encoded])
+)
+
+# ── 3. Predict lambda (expected goal count) ───────────────────────────────────
+lambda_new <- predict(model_xgb_goals, new_matrix)
+
+# ── 4. Generate probabilities using NB distribution ───────────────────────────
+lines <- 1:6
+
+prob_table <- lapply(lines, function(l) {
+  new_data %>%
+    mutate(
+      line         = l,
+      prob_over_nb = pnbinom(l - 1, size = best_theta,
+                             mu = lambda_new, lower.tail = FALSE),
+      decimal_odds = 1 / prob_over_nb
+    ) %>%
+    dplyr::select(player.givenName, player.surname, opponent, line,
+                  prob_over_nb, decimal_odds, confidence_flag)
+}) %>%
+  bind_rows()
+
+# ── Point prediction ──────────────────────────────────────────────────────────
+point_predictions <- new_data %>%
+  mutate(predicted_goals = round(lambda_new, 2)) %>%
+  dplyr::select(player.givenName, player.surname, opponent, predicted_goals)
+
+# ── Pivot wide ────────────────────────────────────────────────────────────────
+prob_table_wide <- prob_table %>%
+  dplyr::select(player.givenName, player.surname, opponent,
+                line, decimal_odds, confidence_flag) %>%
+  pivot_wider(
+    names_from   = line,
+    values_from  = decimal_odds,
+    names_prefix = "line_"
+  ) %>%
+  left_join(point_predictions, by = c("player.givenName", "player.surname", "opponent"))
+
+# ── Get Sportsbet odds ────────────────────────────────────────────────────────
+event_ids   <- sportsbet_eventid_extractor()
+all_markets <- bind_rows(map(event_ids$event_id, sportsbet_Scraper))
+
+# ── Clean Sportsbet odds ──────────────────────────────────────────────────────
+clean_odds <- extract_afl_props(all_markets) %>%
+  mutate(fair_odds = 1 / ((1 / odds) / 1.08))
+
+
+clean_odds_wide <- clean_odds %>%
+  mutate(
+    line      = as.numeric(str_extract(market, "\\d+")),
+    full_name = selection_name
+  ) %>%
+  filter(
+    stat == "goals" | stat == "goal",
+    str_detect(market, "^\\d+\\+\\s*[Gg]oals?$")
+  ) %>%
+  mutate(
+    player.givenName = str_extract(full_name, "^\\S+"),
+    player.surname   = str_remove(full_name,  "^\\S+\\s+")
+  ) %>%
+  dplyr::select(player.givenName, player.surname, line, odds, fair_odds) %>%
+  pivot_wider(
+    names_from  = line,
+    values_from = c(odds, fair_odds),
+    names_glue  = "{.value}_{line}"
+  ) %>%
+  rename_with(~ str_replace(., "^odds_",      "sportsbet_odds_"),      starts_with("odds_")) %>%
+  rename_with(~ str_replace(., "^fair_odds_", "sportsbet_fair_odds_"), starts_with("fair_odds_"))
+
+# ── Join and filter insufficient history ─────────────────────────────────────
+comparison <- prob_table_wide %>%
+  left_join(clean_odds_wide, by = c("player.givenName", "player.surname")) %>%
+  filter(confidence_flag == "ok")
+
+# ── Derive common lines ───────────────────────────────────────────────────────
+model_lines     <- as.numeric(str_extract(colnames(comparison)[str_detect(colnames(comparison), "^line_\\d+")], "\\d+"))
+sportsbet_lines <- as.numeric(str_extract(colnames(comparison)[str_detect(colnames(comparison), "^sportsbet_odds_\\d+")], "\\d+"))
+common_lines    <- intersect(model_lines, sportsbet_lines)
+
+# ── Calculate EV ─────────────────────────────────────────────────────────────
+for (l in common_lines) {
+  model_col     <- paste0("line_", l)
+  sportsbet_col <- paste0("sportsbet_odds_", l)
+  ev_col        <- paste0("ev_", l)
+
+  comparison <- comparison %>%
+    mutate(
+      !!ev_col := (1 / .data[[model_col]]) * (.data[[sportsbet_col]] - 1) -
+                 (1 - (1 / .data[[model_col]])) * 1
+    )
+}
+
+# ── Pivot model odds long ─────────────────────────────────────────────────────
+model_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, opponent,
+                predicted_goals, starts_with("line_")) %>%
+  pivot_longer(
+    cols         = starts_with("line_"),
+    names_to     = "line",
+    values_to    = "model_odds",
+    names_prefix = "line_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot sportsbet odds long ─────────────────────────────────────────────────
+sportsbet_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("sportsbet_odds_")) %>%
+  pivot_longer(
+    cols         = starts_with("sportsbet_odds_"),
+    names_to     = "line",
+    values_to    = "sportsbet_odds",
+    names_prefix = "sportsbet_odds_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Pivot EV long ─────────────────────────────────────────────────────────────
+ev_long <- comparison %>%
+  dplyr::select(player.givenName, player.surname, starts_with("ev_")) %>%
+  pivot_longer(
+    cols         = starts_with("ev_"),
+    names_to     = "line",
+    values_to    = "ev",
+    names_prefix = "ev_"
+  ) %>%
+  mutate(line = as.numeric(line))
+
+# ── Join all three and filter positive EV ────────────────────────────────────
+comparison_long <- model_long %>%
+  left_join(sportsbet_long, by = c("player.givenName", "player.surname", "line")) %>%
+  left_join(ev_long,        by = c("player.givenName", "player.surname", "line")) %>%
+  filter(!is.na(ev), !is.na(sportsbet_odds), ev > 0) %>%
+  dplyr::select(player.givenName, player.surname, opponent,
+                predicted_goals, line, model_odds, sportsbet_odds, ev) %>%
+  arrange(desc(ev))
+
+print(comparison_long, n = Inf)
+```

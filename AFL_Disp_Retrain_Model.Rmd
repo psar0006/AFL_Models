@@ -1,0 +1,465 @@
+---
+title: "AFL_Model_Retrain"
+output: html_document
+date: "2026-04-14"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(fitzRoy)
+library(dplyr)
+library(purrr)
+library(lubridate)
+library(slider)
+library(tidyr)
+```
+
+## R Markdown
+
+```{r EWMA}
+library(purrr)
+
+calc_ewma <- function(x, alpha = 0.7) {
+  if (length(x) == 0) return(numeric(0))
+  accumulate(x, ~ alpha * .y + (1 - alpha) * .x)
+}
+
+```
+
+```{r}
+##Extract Data spanning the past decade
+current_year <- as.numeric(format(Sys.Date(), "%Y"))
+seasons <- 2016:current_year
+data_player <- map_dfr(seasons, ~ fetch_player_stats(season = .x))
+
+##Get AFL fixture to help determine opponent team 
+fixtures <- fetch_fixture(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS") %>%
+  dplyr::select(providerId, home.team.name, away.team.name)
+
+
+##Extract AFL Lineup data of games that haven't happened
+afl_lineups <- fetch_lineup_afl(season = current_year) %>%
+  filter(status == "UNCONFIRMED_TEAMS") %>%
+  left_join(fixtures, by="providerId") %>%
+  mutate(year = year(utcStartTime),
+         opponent = case_when(
+           teamType == 'home' & teamName == home.team.name ~ away.team.name,
+           teamType == 'away' & teamName == away.team.name ~ home.team.name
+         ),
+         venue = venue.name) %>%
+  dplyr::select(providerId,
+                status,
+                player.playerId,
+                player.playerName.givenName, 
+                player.playerName.surname,
+                position,
+                year,
+                round.roundNumber,
+                teamName,
+                opponent,
+                venue
+                )
+
+## Extract total cbas in a game
+#cba attended/total clearance per game to get percentage
+ttl_cba_per_match <- data_player %>%
+group_by(providerId) %>%
+  summarise(
+  total_cbs = sum( clearances.centreClearances, na.rm = TRUE),
+  .groups = "drop")
+
+
+## Create dataframe that will be binded onto player stats disposals
+# Align afl_lineups columns to match player_stats_disposals schema
+future_games <- afl_lineups %>%
+  mutate(
+    player.givenName                        = player.playerName.givenName,
+    player.surname                          = player.playerName.surname,
+    player.player.position                  = position,
+    team.name                               = teamName,
+    disposals                               = NA_real_,
+    inside50s  = NA_real_,
+    clearances.totalClearances             = NA_real_,
+    timeOnGroundPercentage                  = NA_real_,
+    CBA_prop    = NA_real_,
+    extendedStats.pressureActs              = NA_real_,
+    extendedStats.defHalfPressureActs       = NA_real_,
+    contestedPossessions = NA_real_,
+    uncontestedPossessions = NA_real_,
+    extendedStats.groundBallGets = NA_real_,
+    metresGained = NA_real_
+  ) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.playerId,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    disposals,
+    clearances.totalClearances,
+    inside50s,
+    timeOnGroundPercentage,
+    CBA_prop,
+    #Following below is used for team stats
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets,
+    metresGained
+  )
+
+
+
+##Get the disposal stats
+player_stats_disposals_concluded <- data_player  %>%
+  left_join(ttl_cba_per_match, by = c("providerId")) %>%
+  filter(status == "CONCLUDED" | status == "CONFIRMED_TEAMS" ) %>%
+  mutate(year = year(utcStartTime),
+         CBA_prop = (extendedStats.centreBounceAttendances/total_cbs) * 100,
+         opponent = case_when(
+           teamStatus == 'home' & team.name == home.team.name ~ away.team.name,
+           teamStatus == 'away' & team.name == away.team.name ~ home.team.name
+         ),
+    venue = venue.name) %>%
+  dplyr::select(
+    providerId,
+    status,
+    player.playerId,
+    player.givenName,
+    player.surname,
+    player.player.position,
+    year,
+    round.roundNumber,
+    team.name,
+    opponent,
+    venue,
+    disposals,
+    inside50s,
+    clearances.totalClearances,
+    timeOnGroundPercentage,
+    CBA_prop,
+    #Following below is used for team stats
+    contestedPossessions,
+    uncontestedPossessions,
+    extendedStats.groundBallGets,
+    metresGained
+    
+  )
+
+# Bind into the main dataframe
+player_stats_disposals <- bind_rows(player_stats_disposals_concluded, future_games)
+
+```
+
+
+```{r feature_engineering}
+##conduct feature engineering on the data that will be trained on
+
+##Use lag function to get prior game disposal
+player_stats_disposals <- player_stats_disposals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    disp_lag = lag(disposals),
+    inside50s_lag = lag(inside50s),
+    totalClearances_lag = lag(clearances.totalClearances),
+    cba_lag = lag(CBA_prop),
+    tog_lag = lag(timeOnGroundPercentage),
+    cp_lag = lag(contestedPossessions),
+    ucp_lag = lag(uncontestedPossessions),
+    gbg_lag = lag(extendedStats.groundBallGets),
+    mg_lag = lag(metresGained)
+    
+  )
+
+##Calculate averages and use lag to shift prior
+player_stats_disposals <- player_stats_disposals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    ewma_disp_lag    = replace(disp_lag, !is.na(disp_lag), calc_ewma(disp_lag[!is.na(disp_lag)])),
+    ewma_inside50s_lag    = replace(inside50s_lag, !is.na(inside50s_lag), calc_ewma(inside50s_lag[!is.na(inside50s_lag)])),
+    ewma_totalClearances_lag  = replace(totalClearances_lag, !is.na(totalClearances_lag), calc_ewma(totalClearances_lag[!is.na(totalClearances_lag)])),
+    ewma_TOG_lag     = replace(tog_lag, !is.na(tog_lag), calc_ewma(tog_lag[!is.na(tog_lag)])),
+    ewma_cba_lag     = replace(cba_lag, !is.na(cba_lag), calc_ewma(cba_lag[!is.na(cba_lag)])),
+    avg_disp_last5   = lag(slide_dbl(disp_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    var_disp_last5   = lag(slide_dbl(disp_lag, ~ var(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_inside50s_last5   = lag(slide_dbl(inside50s_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_totalClearances_last5   = lag(slide_dbl(totalClearances_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_TOG_last5   = lag(slide_dbl(tog_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_cba_last5   = lag(slide_dbl(cba_lag, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_disp_last3   = lag(slide_dbl(disp_lag, ~ mean(.x, na.rm = TRUE), .before = 2, .complete = FALSE)),
+    var_disp_last3   = lag(slide_dbl(disp_lag, ~ var(.x, na.rm = TRUE), .before = 2, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+
+opponent_defensive_profile <- player_stats_disposals %>%      # exclude future game rows
+  group_by(year, round.roundNumber, opponent) %>%
+  summarise(
+    disp_conceded          = sum(disp_lag,                       na.rm = TRUE),
+    cont_poss_conceded     = sum(cp_lag,            na.rm = TRUE),
+    uncont_poss_conceded   = sum(ucp_lag,          na.rm = TRUE),
+    gbg_conceded           = sum(gbg_lag,    na.rm = TRUE),
+    metres_gained_conceded = sum(mg_lag,      na.rm = TRUE),
+    .groups = "drop"
+  )
+
+library(slider)
+
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  arrange(opponent, year, round.roundNumber) %>%
+  group_by(opponent, year) %>%
+  mutate(
+    # Rolling 5 game average for each stat
+    avg_disp_conceded          = lag(slide_dbl(disp_conceded,          ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_cont_poss_conceded     = lag(slide_dbl(cont_poss_conceded,     ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_uncont_poss_conceded   = lag(slide_dbl(uncont_poss_conceded,   ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_gbg_conceded           = lag(slide_dbl(gbg_conceded,           ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE)),
+    avg_metres_gained_conceded = lag(slide_dbl(metres_gained_conceded, ~ mean(.x, na.rm = TRUE), .before = 4, .complete = FALSE))
+  ) %>%
+  ungroup()
+
+
+league_avgs <- opponent_defensive_profile %>%
+  filter(!is.na(avg_disp_conceded)) %>%
+  summarise(
+    league_disp          = mean(disp_conceded,          na.rm = TRUE),
+    league_cont_poss     = mean(cont_poss_conceded,     na.rm = TRUE),
+    league_uncont_poss   = mean(uncont_poss_conceded,   na.rm = TRUE),
+    league_gbg           = mean(gbg_conceded,           na.rm = TRUE),
+    league_metres_gained = mean(metres_gained_conceded, na.rm = TRUE)
+  )
+
+opponent_defensive_profile <- opponent_defensive_profile %>%
+  mutate(
+    opp_disp_factor          = avg_disp_conceded          / league_avgs$league_disp,
+    opp_cont_poss_factor     = avg_cont_poss_conceded     / league_avgs$league_cont_poss,
+    opp_uncont_poss_factor   = avg_uncont_poss_conceded   / league_avgs$league_uncont_poss,
+    opp_gbg_factor           = avg_gbg_conceded           / league_avgs$league_gbg,
+    opp_metres_gained_factor = avg_metres_gained_conceded / league_avgs$league_metres_gained
+  ) %>%
+  dplyr::select(
+    year, round.roundNumber, opponent,
+    opp_disp_factor,
+    opp_cont_poss_factor,
+    opp_uncont_poss_factor,
+    opp_gbg_factor,
+    opp_metres_gained_factor
+  )
+
+player_stats_disposals <- player_stats_disposals %>%
+  left_join(
+    opponent_defensive_profile,
+    by = c("opponent", "year", "round.roundNumber")
+  )
+
+```
+
+```{r}
+##Final Data Output
+
+
+player_stats_disposals_concluded <- player_stats_disposals %>%
+  filter(status == "CONCLUDED") %>% 
+  dplyr::select(player.playerId,player.givenName, player.surname, 
+         player.player.position, year, round.roundNumber, opponent, venue, disposals,
+         disp_lag, cba_lag, tog_lag, totalClearances_lag, inside50s_lag,
+         ewma_TOG_lag, ewma_disp_lag, ewma_cba_lag, ewma_inside50s_lag, ewma_totalClearances_lag, 
+         avg_disp_last5, avg_cba_last5, avg_TOG_last5, avg_inside50s_last5, avg_totalClearances_last5,
+        var_disp_last5, avg_disp_last3,
+        var_disp_last3, opp_disp_factor, opp_cont_poss_factor, opp_uncont_poss_factor,
+        opp_gbg_factor, opp_metres_gained_factor) %>%
+  drop_na()
+
+```
+
+
+```{r}
+library(xgboost)
+library(dplyr)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  mutate(
+    position_encoded = as.numeric(as.factor(player.player.position)),
+    venue_encoded    = as.numeric(as.factor(venue)),
+    opp_encoded      = as.numeric(as.factor(opponent))
+  )
+
+features_encoded <- c(
+  "ewma_disp_lag","avg_disp_last5","avg_disp_last3",
+  "ewma_TOG_lag","ewma_cba_lag","ewma_inside50s_lag",
+  "ewma_totalClearances_lag","avg_inside50s_last5",
+  "avg_totalClearances_last5","avg_cba_last5","avg_TOG_last5",
+  "disp_lag","cba_lag","tog_lag",
+  "var_disp_last5","var_disp_last3",
+  "opp_disp_factor","opp_cont_poss_factor","opp_uncont_poss_factor",
+  "opp_gbg_factor","opp_metres_gained_factor",
+  "position_encoded","venue_encoded","opp_encoded"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. SORT — no train/test split, use all data
+# ─────────────────────────────────────────────────────────────────────────────
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  arrange(year, round.roundNumber)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. RETRAIN BASE MODEL ON FULL DATA
+# ─────────────────────────────────────────────────────────────────────────────
+full_matrix <- xgb.DMatrix(
+  data  = as.matrix(player_stats_disposals_concluded[, features_encoded]),
+  label = player_stats_disposals_concluded$disposals
+)
+
+params <- list(
+  objective        = "count:poisson",
+  eta              = 0.05,
+  max_depth        = 5,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 10
+)
+
+model_xgb_final <- xgb.train(
+  params  = params,
+  data    = full_matrix,
+  nrounds = 1000,
+  verbose = 1
+)
+
+# In-sample lambda for sigma model training
+lambda_full <- predict(model_xgb_final, full_matrix)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. RETRAIN DYNAMIC SIGMA MODEL ON FULL DATA
+# ─────────────────────────────────────────────────────────────────────────────
+full_sigma <- player_stats_disposals_concluded %>%
+  mutate(squared_residual = (disposals - lambda_full)^2)
+
+sigma_matrix_full <- xgb.DMatrix(
+  data  = as.matrix(full_sigma[, features_encoded]),
+  label = full_sigma$squared_residual
+)
+
+sigma_model_final <- xgb.train(
+  params = list(
+    objective        = "reg:squarederror",
+    eta              = 0.05,
+    max_depth        = 3,
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 20
+  ),
+  data    = sigma_matrix_full,
+  nrounds = 1000,   # fixed — use same as evaluation run
+  verbose = 0
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. STABILISATION USING BEST ALPHA FROM EVALUATION RUN
+# ─────────────────────────────────────────────────────────────────────────────
+sigma_global_final <- sd(player_stats_disposals_concluded$disposals - lambda_full)
+
+
+cat("Global Sigma (full data): ", round(sigma_global_final, 4), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. CALIBRATION AWARE SIGMA TUNING
+# ─────────────────────────────────────────────────────────────────────────────
+# Rather than arbitrary alpha, find the alpha that minimises calibration error
+
+best_alpha <- NULL
+best_cal_error <- Inf
+
+for (alpha in seq(0.3, 0.9, by = 0.1)) {
+  
+  sigma_candidate <- pmax(
+    alpha * sqrt(pmax(predict(sigma_model_final, sigma_matrix_full), 0)) + 
+    (1 - alpha) * sigma_global_final, 1
+  )
+  
+  cal_error <- mean(sapply(c(15, 20, 25, 30), function(l) {
+    pred_prob   <- mean(pnorm(l - 0.5, mean = lambda_full, 
+                              sd = sigma_candidate, lower.tail = FALSE))
+    actual_rate <- mean(player_stats_disposals_concluded$disposals >= l)
+    (pred_prob - actual_rate)^2
+  }))
+  
+  if (cal_error < best_cal_error) {
+    best_cal_error <- cal_error
+    best_alpha     <- alpha
+  }
+}
+
+cat("Best alpha: ", best_alpha, "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. PREDICT ON NEW/UPCOMING DATA
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Apply same encoding using levels from full concluded data
+pos_levels  <- levels(as.factor(player_stats_disposals_concluded$player.player.position))
+venue_levels <- levels(as.factor(player_stats_disposals_concluded$venue))
+opp_levels  <- levels(as.factor(player_stats_disposals_concluded$opponent))
+
+# Get unseen data
+new_data <- player_stats_disposals %>%
+  filter(status != "CONCLUDED") %>% 
+  dplyr::select(player.playerId,player.givenName, player.surname, 
+         player.player.position, year, round.roundNumber, opponent, venue, disposals,
+         disp_lag, cba_lag, tog_lag, totalClearances_lag, inside50s_lag,
+         ewma_TOG_lag, ewma_disp_lag, ewma_cba_lag, ewma_inside50s_lag, ewma_totalClearances_lag, 
+         avg_disp_last5, avg_cba_last5, avg_TOG_last5, avg_inside50s_last5, avg_totalClearances_last5,
+        var_disp_last5, avg_disp_last3,
+        var_disp_last3, opp_disp_factor, opp_cont_poss_factor, opp_uncont_poss_factor,
+        opp_gbg_factor, opp_metres_gained_factor) 
+
+new_data <- new_data %>%
+  mutate(
+    position_encoded = as.numeric(factor(player.player.position, levels = pos_levels)),
+    venue_encoded    = as.numeric(factor(venue,                  levels = venue_levels)),
+    opp_encoded      = as.numeric(factor(opponent,               levels = opp_levels))
+  )
+
+new_matrix <- xgb.DMatrix(
+  data = as.matrix(new_data[, features_encoded])
+)
+
+# Lambda predictions
+lambda_xgb <- predict(model_xgb_final, new_matrix)
+
+# Dynamic sigma predictions
+sigma_new_raw <- sqrt(pmax(predict(sigma_model_final, new_matrix), 0))
+sigma_xgb_norm    <- pmax(best_alpha * sigma_new_raw + (1 - best_alpha) * sigma_global_final, 1)
+
+
+# Save levels from training data
+pos_levels  <- levels(as.factor(player_stats_disposals_concluded$player.player.position))
+venue_levels <- levels(as.factor(player_stats_disposals_concluded$venue))
+opp_levels  <- levels(as.factor(player_stats_disposals_concluded$opponent))
+
+xgb.save(model_xgb_final, "model_xgb_final.ubj")
+
+saveRDS(list(
+  features_xgb   = features_encoded,
+  sigma_xgb_norm = sigma_xgb_norm,
+  pos_levels_xgb = pos_levels,
+  venue_levels_xgb = venue_levels,
+  opp_levels_xgb = opp_levels
+), "xgb_system.rds")
+
+```
