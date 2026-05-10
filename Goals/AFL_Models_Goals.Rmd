@@ -10,6 +10,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r libraries, include=FALSE}
 library(fitzRoy)
+library(ggplot2)
 library(dplyr)
 library(purrr)
 library(lubridate)
@@ -176,6 +177,85 @@ player_stats_goals_concluded <- data_player  %>%
 player_stats_goals <- bind_rows(player_stats_goals_concluded, future_games)
 
 ```
+```{r eda}
+# Check zero inflation by position
+player_stats_goals_concluded %>%
+  group_by(player.player.position) %>%
+  summarise(
+    n               = n(),
+    mean_goals      = mean(goals, na.rm = TRUE),
+    observed_zeros  = sum(goals == 0),
+    expected_zeros  = round(dpois(0, lambda = mean(goals, na.rm = TRUE)) * n()),
+    zero_ratio      = observed_zeros / expected_zeros
+  ) %>%
+  arrange(desc(zero_ratio))
+
+
+```
+
+```{r}
+library(MASS)
+
+# ── Fit Geometric distribution ────────────────────────────────────────────────
+# Geometric MLE is simply 1 / (1 + mean(goals))
+goals_observed <- player_stats_goals_concluded$goals
+
+# MLE estimate of p (success probability)
+p_geom <- 1 / (1 + mean(goals_observed, na.rm = TRUE))
+
+cat("Geometric p (MLE): ", round(p_geom, 4), "\n")
+cat("Implied mean:      ", round((1 - p_geom) / p_geom, 4), "\n")
+
+# ── Overlay on histogram ──────────────────────────────────────────────────────
+max_goals <- max(goals_observed, na.rm = TRUE)
+x_vals    <- 0:max_goals
+
+geom_probs <- dgeom(x_vals, prob = p_geom)
+
+geom_fit <- tibble(
+  goals = x_vals,
+  expected_freq = geom_probs * length(goals_observed)
+)
+
+ggplot(player_stats_goals_concluded, aes(x = goals)) +
+  geom_histogram(binwidth = 1, fill = "#3B82F6", colour = "white",
+                 alpha = 0.7, aes(y = after_stat(count))) +
+  geom_line(data = geom_fit, aes(x = goals, y = expected_freq),
+            colour = "red", size = 1.2) +
+  geom_point(data = geom_fit, aes(x = goals, y = expected_freq),
+             colour = "red", size = 2.5) +
+  scale_x_continuous(breaks = seq(0, max_goals, by = 1)) +
+  labs(
+    title    = "Goals Distribution with Geometric Fit",
+    subtitle = paste0("Geometric p = ", round(p_geom, 4),
+                      " | Mean = ", round(mean(goals_observed, na.rm = TRUE), 2)),
+    x        = "Goals",
+    y        = "Frequency",
+    caption  = "Red line = fitted Geometric distribution"
+  ) +
+  theme_minimal(base_size = 13)
+
+# ── Calibration check against NB ─────────────────────────────────────────────
+lines_eval <- c(1, 2, 3, 4)
+
+calibration_geom <- lapply(lines_eval, function(l) {
+  tibble(
+    model         = "Geometric",
+    line          = l,
+    avg_pred_prob = mean(pgeom(l - 1, prob = p_geom, lower.tail = FALSE),
+                         na.rm = TRUE),
+    actual_rate   = mean(goals_observed >= l, na.rm = TRUE),
+    n             = length(goals_observed)
+  )
+}) %>%
+  bind_rows()
+
+print(calibration_geom)
+
+
+
+```
+
 
 ```{r feature_engineering}
 ##conduct feature engineering on the data that will be trained on
