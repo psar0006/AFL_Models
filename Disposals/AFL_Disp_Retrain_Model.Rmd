@@ -21,7 +21,7 @@ library(tidyr)
 ```{r EWMA}
 library(purrr)
 
-calc_ewma <- function(x, alpha = 0.7) {
+calc_ewma <- function(x, alpha = 0.1) {
   if (length(x) == 0) return(numeric(0))
   accumulate(x, ~ alpha * .y + (1 - alpha) * .x)
 }
@@ -185,6 +185,7 @@ player_stats_disposals <- player_stats_disposals %>%
   arrange(year, round.roundNumber) %>%
   group_by(player.playerId) %>%
   mutate(
+    season_avg_disp_lag = lag(cummean(disposals)),
     ewma_disp_lag    = replace(disp_lag, !is.na(disp_lag), calc_ewma(disp_lag[!is.na(disp_lag)])),
     ewma_inside50s_lag    = replace(inside50s_lag, !is.na(inside50s_lag), calc_ewma(inside50s_lag[!is.na(inside50s_lag)])),
     ewma_totalClearances_lag  = replace(totalClearances_lag, !is.na(totalClearances_lag), calc_ewma(totalClearances_lag[!is.na(totalClearances_lag)])),
@@ -201,6 +202,33 @@ player_stats_disposals <- player_stats_disposals %>%
   ) %>%
   ungroup()
 
+## Capture any changes in player roles and trend changes
+
+player_stats_disposals <- player_stats_disposals %>%
+  arrange(year, round.roundNumber) %>%
+  group_by(player.playerId) %>%
+  mutate(
+    role_shift_cba =
+      cba_lag - ewma_cba_lag,
+
+    role_shift_tog =
+      tog_lag - ewma_TOG_lag,
+    
+    trend_disp_3 =
+      avg_disp_last3 - avg_disp_last5,
+
+    trend_cba_5 =
+      cba_lag - avg_cba_last5,
+
+    trend_tog_5 =
+      tog_lag - avg_TOG_last5,
+    
+    ewma_vs_season =
+      ewma_disp_lag - season_avg_disp_lag,
+
+    avg5_vs_season =
+      avg_disp_last5 - season_avg_disp_lag) %>%
+  ungroup()
 
 opponent_defensive_profile <- player_stats_disposals %>%      # exclude future game rows
   group_by(year, round.roundNumber, opponent) %>%
@@ -271,15 +299,13 @@ player_stats_disposals <- player_stats_disposals %>%
 player_stats_disposals_concluded <- player_stats_disposals %>%
   filter(status == "CONCLUDED") %>% 
   dplyr::select(player.playerId,player.givenName, player.surname, 
-         player.player.position, year, round.roundNumber, opponent, venue, disposals,
-         disp_lag, cba_lag, tog_lag, totalClearances_lag, inside50s_lag,
+         player.player.position, year, round.roundNumber, opponent, venue, disposals, season_avg_disp_lag,
+         role_shift_cba, role_shift_tog, trend_tog_5, trend_cba_5, trend_disp_3, ewma_vs_season, avg5_vs_season,
          ewma_TOG_lag, ewma_disp_lag, ewma_cba_lag, ewma_inside50s_lag, ewma_totalClearances_lag, 
          avg_disp_last5, avg_cba_last5, avg_TOG_last5, avg_inside50s_last5, avg_totalClearances_last5,
         var_disp_last5, avg_disp_last3,
         var_disp_last3, opp_disp_factor, opp_cont_poss_factor, opp_uncont_poss_factor,
-        opp_gbg_factor, opp_metres_gained_factor) %>%
-  drop_na()
-
+        opp_gbg_factor, opp_metres_gained_factor)
 ```
 
 
@@ -296,19 +322,52 @@ player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
     venue_encoded    = as.numeric(as.factor(venue)),
     opp_encoded      = as.numeric(as.factor(opponent))
   )
+  
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  filter(is.finite(disposals))  
 
 features_encoded <- c(
-  "ewma_disp_lag","avg_disp_last5","avg_disp_last3",
-  "ewma_TOG_lag","ewma_cba_lag","ewma_inside50s_lag",
-  "ewma_totalClearances_lag","avg_inside50s_last5",
-  "avg_totalClearances_last5","avg_cba_last5","avg_TOG_last5",
-  "disp_lag","cba_lag","tog_lag",
-  "var_disp_last5","var_disp_last3",
-  "opp_disp_factor","opp_cont_poss_factor","opp_uncont_poss_factor",
-  "opp_gbg_factor","opp_metres_gained_factor",
-  "position_encoded","venue_encoded","opp_encoded"
-)
+  # form
+  "ewma_disp_lag",
+  "avg_disp_last5",
+  "avg_disp_last3",
 
+  # baseline
+  "season_avg_disp_lag",
+  "ewma_vs_season",
+  "avg5_vs_season",
+
+  # consistency
+  "var_disp_last5",
+  "var_disp_last3",
+
+  # role
+  "ewma_TOG_lag",
+  "ewma_cba_lag",
+  "ewma_inside50s_lag",
+  "ewma_totalClearances_lag",
+
+  # role change
+  "role_shift_cba",
+  "role_shift_tog",
+
+  # trend
+  "trend_disp_3",
+  "trend_cba_5",
+  "trend_tog_5",
+
+  # opponent
+  "opp_disp_factor",
+  "opp_cont_poss_factor",
+  "opp_uncont_poss_factor",
+  "opp_gbg_factor",
+  "opp_metres_gained_factor",
+
+  # categorical
+  "position_encoded",
+  "venue_encoded",
+  "opp_encoded"
+)
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. SORT — no train/test split, use all data
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,3 +522,194 @@ saveRDS(list(
 ), "xgb_system.rds")
 
 ```
+
+library(xgboost)
+library(dplyr)
+library(MASS)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  mutate(
+    position_encoded = as.numeric(as.factor(player.player.position)),
+    venue_encoded    = as.numeric(as.factor(venue)),
+    opp_encoded      = as.numeric(as.factor(opponent))
+  )
+  
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  filter(is.finite(disposals))  
+
+features_encoded <- c(
+  # form
+  "ewma_disp_lag",
+  "avg_disp_last5",
+  "avg_disp_last3",
+
+  # baseline
+  "season_avg_disp_lag",
+  "ewma_vs_season",
+  "avg5_vs_season",
+
+  # consistency
+  "var_disp_last5",
+  "var_disp_last3",
+
+  # role
+  "ewma_TOG_lag",
+  "ewma_cba_lag",
+  "ewma_inside50s_lag",
+  "ewma_totalClearances_lag",
+
+  # role change
+  "role_shift_cba",
+  "role_shift_tog",
+
+  # trend
+  "trend_disp_3",
+  "trend_cba_5",
+  "trend_tog_5",
+
+  # opponent
+  "opp_disp_factor",
+  "opp_cont_poss_factor",
+  "opp_uncont_poss_factor",
+  "opp_gbg_factor",
+  "opp_metres_gained_factor",
+
+  # categorical
+  "position_encoded",
+  "venue_encoded",
+  "opp_encoded"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. SORT — no train/test split, use all data
+# ─────────────────────────────────────────────────────────────────────────────
+player_stats_disposals_concluded <- player_stats_disposals_concluded %>%
+  arrange(year, round.roundNumber)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. RETRAIN BASE MODEL ON FULL DATA
+# ─────────────────────────────────────────────────────────────────────────────
+full_matrix <- xgb.DMatrix(
+  data  = as.matrix(player_stats_disposals_concluded[, features_encoded]),
+  label = player_stats_disposals_concluded$disposals
+)
+
+params <- list(
+  objective        = "count:poisson",
+  eta              = 0.05,
+  max_depth        = 5,
+  subsample        = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 10
+)
+
+model_xgb_final <- xgb.train(
+  params  = params,
+  data    = full_matrix,
+  nrounds = best_nrounds,  # from evaluation run
+  verbose = 1
+)
+
+lambda_full <- predict(model_xgb_final, full_matrix)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. FIT NB THETA ON FULL DATA
+# ─────────────────────────────────────────────────────────────────────────────
+theta_nb_raw <- tryCatch(
+  fitdistr(
+    player_stats_disposals_concluded$disposals,
+    "negative binomial",
+    start = list(mu = mean(lambda_full), size = 10)
+  )$estimate["size"],
+  error = function(e) {
+    cat("NB theta fit failed, using fallback of 10\n")
+    10
+  }
+)
+
+cat("Theta (NB raw): ", round(theta_nb_raw, 4), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. CALIBRATION AWARE THETA TUNING ON FULL DATA
+# ─────────────────────────────────────────────────────────────────────────────
+best_theta_final <- theta_nb_raw
+best_cal_error   <- Inf
+
+for (theta_candidate in seq(1, 30, by = 0.5)) {
+  cal_error <- mean(sapply(c(15, 20, 25, 30), function(l) {
+    pred_prob   <- mean(pnbinom(l - 1, size = theta_candidate,
+                                mu = lambda_full, lower.tail = FALSE))
+    actual_rate <- mean(player_stats_disposals_concluded$disposals >= l)
+    (pred_prob - actual_rate)^2
+  }))
+
+  if (cal_error < best_cal_error) {
+    best_cal_error   <- cal_error
+    best_theta_final <- theta_candidate
+  }
+}
+
+cat("Best Theta (tuned): ", round(best_theta_final, 4), "\n")
+cat("Best cal error:     ", round(best_cal_error,   6), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. PREDICT ON NEW/UPCOMING DATA
+# ─────────────────────────────────────────────────────────────────────────────
+pos_levels   <- levels(as.factor(player_stats_disposals_concluded$player.player.position))
+venue_levels <- levels(as.factor(player_stats_disposals_concluded$venue))
+opp_levels   <- levels(as.factor(player_stats_disposals_concluded$opponent))
+
+new_data <- player_stats_disposals %>%
+  filter(status != "CONCLUDED") %>%
+  dplyr::select(
+    player.playerId, player.givenName, player.surname,
+    player.player.position, year, round.roundNumber, opponent, venue, disposals,
+    disp_lag, cba_lag, tog_lag, totalClearances_lag, inside50s_lag,
+    ewma_TOG_lag, ewma_disp_lag, ewma_cba_lag, ewma_inside50s_lag, ewma_totalClearances_lag,
+    avg_disp_last5, avg_cba_last5, avg_TOG_last5, avg_inside50s_last5, avg_totalClearances_last5,
+    var_disp_last5, avg_disp_last3,
+    var_disp_last3, opp_disp_factor, opp_cont_poss_factor, opp_uncont_poss_factor,
+    opp_gbg_factor, opp_metres_gained_factor
+  )
+
+new_data <- new_data %>%
+  mutate(
+    position_encoded = as.numeric(factor(player.player.position, levels = pos_levels)),
+    venue_encoded    = as.numeric(factor(venue,                  levels = venue_levels)),
+    opp_encoded      = as.numeric(factor(opponent,               levels = opp_levels)),
+    confidence_flag  = case_when(
+      is.na(ewma_disp_lag)  ~ "no_history",
+      is.na(avg_disp_last3) ~ "insufficient_history",
+      is.na(avg_disp_last5) ~ "insufficient_history",
+      TRUE                  ~ "ok"
+    )
+  )
+
+new_matrix <- xgb.DMatrix(
+  data = as.matrix(new_data[, features_encoded])
+)
+
+# ── Lambda and NB probabilities ───────────────────────────────────────────────
+lambda_new <- predict(model_xgb_final, new_matrix)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. SAVE MODEL AND PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+xgb.save(model_xgb_nb_final, "model_xgb_nb_final.ubj")
+
+saveRDS(list(
+  features_xgb     = features_encoded,
+  best_theta_final = best_theta_final,
+  theta_nb_raw     = theta_nb_raw,
+  pos_levels_xgb   = pos_levels,
+  venue_levels_xgb = venue_levels,
+  opp_levels_xgb   = opp_levels
+), "xgb_nb_system.rds")
+
+cat("Model and NB parameters saved\n")
+cat("Lambda range:       ", round(range(lambda_new), 2), "\n")
+cat("Theta (raw):        ", round(theta_nb_raw,      4), "\n")
+cat("Theta (tuned):      ", round(best_theta_final,  4), "\n")
